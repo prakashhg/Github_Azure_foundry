@@ -1,0 +1,13 @@
+{
+  "name": "Github_Azure_foundry-node-hello",
+  "version": "1.0.0",
+  "description": "Simple Node.js Hello World project added to the repository",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "echo \"No tests configured\" && exit 0"
+  },
+  "keywords": ["nodejs", "hello-world"],
+  "author": "prakashhg",
+  "license": "MIT"
+}
