@@ -1,0 +1,94 @@
+name: "Issue patch -> PR automation"
+
+on:
+  issues:
+    types: [opened, edited, labeled]
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+jobs:
+  issue-to-pr:
+    name: "Issue to PR (diff patch)"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine if this issue should run automation
+        id: incident
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const issue = context.payload.issue;
+            const hasLabel = (issue.labels || []).some(l => l.name === 'auto-patch' || l.name === 'foundry-auto');
+            const hasDiff = /```diff\n([\s\S]*?)\n```/.test(issue.body || '');
+            if (!hasLabel) {
+              core.notice('Skipping: missing label (auto-patch or foundry-auto).');
+            }
+            if (!hasDiff) {
+              core.notice('Skipping: no diff body found (```diff ... ```).');
+            }
+            return { run: hasLabel && hasDiff };
+
+      - name: Abort if issue does not contain actionable patch input
+        if: steps.incident.outputs.run != 'true'
+        run: |
+          echo "No actionable patch; exiting."
+
+      - name: Extract diff from issue body
+        if: steps.incident.outputs.run == 'true'
+        id: extract
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const body = context.payload.issue.body || '';
+            const match = body.match(/```diff\n([\s\S]*?)\n```/);
+            if (!match) throw new Error('Could not find diff block in issue body.');
+            return match[1];
+
+      - name: Apply diff patch and commit
+        if: steps.incident.outputs.run == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          BRANCH=issue-${{ github.event.issue.number }}-auto-patch
+          git checkout -b "$BRANCH"
+          echo "${{ steps.extract.outputs.result }}" > /tmp/issue.patch
+          cat /tmp/issue.patch
+          git apply /tmp/issue.patch
+          git add -A
+          git diff --staged --quiet || git commit -m "Auto patch from issue #${{ github.event.issue.number }}"
+
+      - name: Create pull request from patch branch
+        if: steps.incident.outputs.run == 'true'
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: issue-${{ github.event.issue.number }}-auto-patch
+          title: "[auto] Apply issue #${{ github.event.issue.number }} patch"
+          body: |
+            This PR was auto-created from issue #${{ github.event.issue.number }}.
+            
+            Original issue title: ${{ github.event.issue.title }}
+          base: main
+          commit-message: "Auto apply patch from issue #${{ github.event.issue.number }}"
+
+      - name: Close issue
+        if: steps.incident.outputs.run == 'true'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            await github.issues.update({
+              ...context.repo,
+              issue_number: context.issue.number,
+              state: 'closed',
+            });
