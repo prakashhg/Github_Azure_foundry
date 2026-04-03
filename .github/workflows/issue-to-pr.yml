@@ -34,10 +34,13 @@ jobs:
           script: |
             const issue = context.payload.issue;
             const hasLabel = (issue.labels || []).some(l => l.name === 'auto-patch' || l.name === 'foundry-auto');
-            if (!hasLabel) {
-              core.notice('Skipping: missing label (auto-patch or foundry-auto).');
-            }
-            return { run: hasLabel };
+            const runValue = hasLabel ? 'true' : 'false';
+            core.notice(`hasLabel=${hasLabel} -> run=${runValue}`);
+            return { run: runValue };
+
+      - name: Debug incident output
+        run: |
+          echo "incident.run=${{ steps.incident.outputs.run }}"
 
       - name: Abort if issue does not contain actionable patch input
         if: steps.incident.outputs.run != 'true'
