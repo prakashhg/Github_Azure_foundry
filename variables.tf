@@ -5,5 +5,5 @@ variable "location" {
 
 variable "foundry_name" {
   type    = string
-  default = "foundrydemo"
+  default = "foundry"  # must be 3-7 chars, lowercase alphanumeric/hyphen
 }
