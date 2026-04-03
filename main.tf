@@ -1,22 +1,29 @@
+# ------------------------------------------------------
+# Resource Group
+# ------------------------------------------------------
 resource "azurerm_resource_group" "rg" {
-  name     = "rg-foundry-demo"
-  location = "eastus"
+  name     = "rg-${var.foundry_name}"
+  location = var.location
 }
 
+# ------------------------------------------------------
+# Azure Verified Module for Foundry
+# ------------------------------------------------------
 module "foundry" {
   source  = "Azure/avm-ptn-aiml-ai-foundry/azurerm"
   version = "0.10.1"
 
-  location            = azurerm_resource_group.rg.location
-  resource_group_name = azurerm_resource_group.rg.name
-  name                = "foundrydemo"
+  # REQUIRED
+  base_name                   = var.foundry_name
+  location                    = var.location
+  resource_group_resource_id  = azurerm_resource_group.rg.id
 
-  # Use default Foundry managed resources
-  use_byor_key_vault = false
-  use_byor_storage   = false
-  use_byor_cosmosdb  = false
-  use_byor_search    = false
+  # OPTIONAL — using default basic setup (platform managed)
+  deploy_ai_search            = false
+  deploy_storage_account      = false
+  deploy_cosmosdb_account     = false
+  deploy_key_vault            = false
 
-  # Enable Foundry Agent default host (no custom containers)
-  enable_agent_service = true
+  # This creates the default Agent service
+  deploy_agent_service        = true
 }
