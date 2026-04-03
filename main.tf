@@ -18,12 +18,11 @@ module "foundry" {
   location                    = var.location
   resource_group_resource_id  = azurerm_resource_group.rg.id
 
-  # OPTIONAL — using default basic setup (platform managed)
-  deploy_ai_search            = false
-  deploy_storage_account      = false
-  deploy_cosmosdb_account     = false
-  deploy_key_vault            = false
+  # OPTIONAL — use module schema for this version
+  create_byor              = false
+  create_private_endpoints = false
 
-  # This creates the default Agent service
-  deploy_agent_service        = true
+  ai_foundry = {
+    create_ai_agent_service = true
+  }
 }
