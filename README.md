@@ -22,16 +22,11 @@ GitHub issue-to-code automation using Azure OpenAI and GitHub Actions.
 └── workflows/
     └── auto-code-generation.yml    # Main GitHub Actions workflow
 
-scripts/
-├── extract-issue.js                 # Parse GitHub issues
-├── generate-code.js                 # Call Azure OpenAI
-└── write-generated-files.js         # Write generated code to repo
-
 main.tf                              # Azure infrastructure
 variables.tf                         # Terraform variables
 outputs.tf                          # Terraform outputs
 providers.tf                        # Azure provider config
-package.json                        # Node.js dependencies
+package.json                        # Optional Node metadata
 ```
 
 ## 🚀 Quick Start

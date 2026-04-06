@@ -157,11 +157,11 @@ We need a secure user authentication system.
 ```
 Issue Created
      ↓
-Extract Issue Details (extract-issue.js)
+Extract Issue Details (inline workflow script)
      ↓
-Call Azure OpenAI GPT-4o (generate-code.js)
+Call Azure OpenAI GPT-4o (inline workflow script)
      ↓
-Write Generated Files (write-generated-files.js)
+Write Generated Files (inline workflow script)
      ↓
 Create Feature Branch
      ↓
@@ -183,10 +183,11 @@ Close Original Issue
 ├── workflows/
 │   └── auto-code-generation.yml    # Main GitHub Actions workflow
 
-scripts/
-├── extract-issue.js                 # Parse issue details
-├── generate-code.js                 # Call Azure OpenAI
-└── write-generated-files.js         # Write generated code
+main.tf                              # Azure Foundry + OpenAI infrastructure
+variables.tf                         # Terraform variables
+outputs.tf                           # Exposed values
+providers.tf                         # Provider configuration
+```
 
 main.tf                              # Azure Foundry + OpenAI infrastructure
 variables.tf                         # Terraform variables
@@ -200,13 +201,13 @@ providers.tf                         # Provider configuration
 
 ### What Azure OpenAI Does
 
-The `generate-code.js` script:
+The GitHub Actions workflow contains inline Node.js steps that:
 
-1. **Analyzes** the GitHub issue title and body
-2. **Extracts** requirements and acceptance criteria
-3. **Detects** the tech stack from the issue
-4. **Prompts** GPT-4o to generate code
-5. **Returns** code in structured JSON format:
+1. **Analyze** the GitHub issue title and body
+2. **Extract** requirements and acceptance criteria
+3. **Detect** the tech stack from the issue
+4. **Prompt** GPT-4o to generate code
+5. **Return** code in structured JSON format:
    ```json
    {
      "files": [
@@ -220,8 +221,8 @@ The `generate-code.js` script:
    }
    ```
 
-5. **Creates** files in the repository
-6. **Commits** with auto-generated message
+6. **Create** files in the repository
+7. **Commit** with auto-generated message
 
 ---
 
@@ -270,7 +271,7 @@ Ensure the endpoint and key match your Azure deployment.
 
 **Solution:** Check Azure OpenAI response:
 1. Ensure "gpt4o-code-gen" deployment exists in Azure
-2. Verify API version in `generate-code.js` matches Azure
+2. Verify API version in `.github/workflows/auto-code-generation.yml` matches Azure
 3. Check quota/usage limits in Azure portal
 
 ### Issue: PR Not Created
@@ -294,7 +295,7 @@ Ensure the endpoint and key match your Azure deployment.
 
 ### Customize Code Generation Prompt
 
-Edit `scripts/generate-code.js` - modify `systemPrompt` and `userPrompt` variables:
+Edit `.github/workflows/auto-code-generation.yml` and update the embedded prompt text in the Generate Code step.
 
 ```javascript
 const systemPrompt = `You are an expert code generation AI...`
@@ -348,9 +349,6 @@ az costmanagement query create \
 - [ ] Azure resources created (check Azure Portal)
 - [ ] GitHub Secrets configured (AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_KEY)
 - [ ] `.github/workflows/auto-code-generation.yml` exists
-- [ ] `scripts/extract-issue.js` exists
-- [ ] `scripts/generate-code.js` exists
-- [ ] `scripts/write-generated-files.js` exists
 - [ ] Test issue created and workflow runs successfully
 - [ ] PR generated with code
 - [ ] Original issue closed automatically

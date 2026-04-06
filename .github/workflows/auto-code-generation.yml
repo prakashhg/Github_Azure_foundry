@@ -34,15 +34,100 @@ jobs:
         with:
           node-version: '18'
 
-      # Install dependencies
-      - name: Install dependencies
-        run: npm install
-
-      # Extract issue details
+      # Extract issue details inline
       - name: Extract Issue Details
         id: issue-details
         run: |
-          node scripts/extract-issue.js "${{ github.event.issue.title }}" "${{ github.event.issue.body }}" "${{ github.event.issue.number }}"
+          node <<'NODE'
+          const fs = require('fs');
+          const path = require('path');
+
+          const issueTitle = process.env.ISSUE_TITLE || '';
+          const issueBody = process.env.ISSUE_BODY || '';
+          const issueNumber = process.env.ISSUE_NUMBER || '';
+
+          console.log('📋 Extracting Issue Details...');
+          console.log(`Issue #${issueNumber}: ${issueTitle}`);
+          console.log('---');
+
+          const details = {
+            number: issueNumber,
+            title: issueTitle,
+            body: issueBody,
+            type: detectIssueType(issueTitle, issueBody),
+            labels: extractLabels(issueBody),
+            acceptanceCriteria: extractAcceptanceCriteria(issueBody),
+            dependencies: extractDependencies(issueBody),
+            techStack: detectTechStack(issueBody),
+          };
+
+          console.log('\n✅ Issue Details Extracted:');
+          console.log(JSON.stringify(details, null, 2));
+
+          fs.writeFileSync(
+            path.join(process.cwd(), '.issue-context.json'),
+            JSON.stringify(details, null, 2)
+          );
+
+          function detectIssueType(title, body) {
+            const lowerTitle = (title + ' ' + body).toLowerCase();
+            if (lowerTitle.includes('bug') || lowerTitle.includes('fix')) return 'bug-fix';
+            if (lowerTitle.includes('feature') || lowerTitle.includes('add')) return 'feature';
+            if (lowerTitle.includes('refactor')) return 'refactor';
+            if (lowerTitle.includes('docs') || lowerTitle.includes('documentation')) return 'documentation';
+            if (lowerTitle.includes('test')) return 'test';
+            return 'task';
+          }
+
+          function extractLabels(body) {
+            const labelRegex = /(?:^|\n)(?:labels?|tags?):\s*(.+?)(?:\n|$)/i;
+            const match = body.match(labelRegex);
+            return match ? match[1].split(',').map(l => l.trim()) : [];
+          }
+
+          function extractAcceptanceCriteria(body) {
+            const criteriaRegex = /(?:^|\n)(?:acceptance\s+criteria|requirements):\s*([\s\S]*?)(?=\n\n|$)/i;
+            const match = body.match(criteriaRegex);
+            if (!match) return [];
+            return match[1]
+              .split('\n')
+              .filter(line => line.trim().startsWith('-') || line.trim().startsWith('*'))
+              .map(line => line.replace(/^[-*]\s*/, '').trim())
+              .filter(line => line.length > 0);
+          }
+
+          function extractDependencies(body) {
+            const depRegex = /(?:^|\n)(?:dependencies?|depends on):\s*(.+?)(?:\n|$)/i;
+            const match = body.match(depRegex);
+            return match ? match[1].split(',').map(d => d.trim()) : [];
+          }
+
+          function detectTechStack(body) {
+            const techs = [];
+            const keywords = {
+              javascript: ['js', 'javascript', 'node', 'nodejs', 'npm'],
+              typescript: ['typescript', 'ts'],
+              python: ['python', 'py'],
+              rust: ['rust', 'cargo'],
+              go: ['golang', 'go'],
+              java: ['java', 'spring'],
+              csharp: ['csharp', 'c#', 'dotnet'],
+              terraform: ['terraform', 'tf', 'iac', 'infrastructure'],
+              react: ['react', 'jsx'],
+              vue: ['vue', 'vuejs'],
+              express: ['express', 'expressjs'],
+              fastapi: ['fastapi', 'fast api'],
+              docker: ['docker', 'container'],
+            };
+            const lowerBody = body.toLowerCase();
+            for (const [tech, keys] of Object.entries(keywords)) {
+              if (keys.some(key => lowerBody.includes(key))) {
+                techs.push(tech);
+              }
+            }
+            return techs;
+          }
+          NODE
         env:
           ISSUE_TITLE: ${{ github.event.issue.title }}
           ISSUE_BODY: ${{ github.event.issue.body }}
@@ -52,11 +137,153 @@ jobs:
       - name: Generate Code with Azure OpenAI
         id: code-generation
         run: |
-          node scripts/generate-code.js
+          node <<'NODE'
+          const https = require('https');
+          const fs = require('fs');
+          const path = require('path');
+
+          const ENDPOINT = process.env.AZURE_OPENAI_ENDPOINT;
+          const API_KEY = process.env.AZURE_OPENAI_KEY;
+          const DEPLOYMENT = process.env.GPT4O_DEPLOYMENT || 'gpt4o-code-gen';
+
+          function callAzureOpenAI(messages) {
+            return new Promise((resolve, reject) => {
+              if (!ENDPOINT || !API_KEY) {
+                reject(new Error('AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_KEY must be set'));
+                return;
+              }
+
+              const url = new URL(`${ENDPOINT}/openai/deployments/${DEPLOYMENT}/chat/completions?api-version=2024-08-01-preview`);
+              const requestBody = JSON.stringify({
+                messages,
+                max_tokens: 4000,
+                temperature: 0.7,
+                top_p: 0.9,
+                stop: null,
+              });
+
+              const options = {
+                hostname: url.hostname,
+                path: url.pathname + url.search,
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'api-key': API_KEY,
+                  'Content-Length': Buffer.byteLength(requestBody),
+                },
+              };
+
+              const req = https.request(options, (res) => {
+                let data = '';
+                res.on('data', (chunk) => { data += chunk; });
+                res.on('end', () => {
+                  try {
+                    const response = JSON.parse(data);
+                    if (response.error) {
+                      reject(new Error(`Azure OpenAI Error: ${response.error.message}`));
+                    } else {
+                      resolve(response);
+                    }
+                  } catch (error) {
+                    reject(new Error(`Failed to parse response: ${error.message}`));
+                  }
+                });
+              });
+
+              req.on('error', reject);
+              req.write(requestBody);
+              req.end();
+            });
+          }
+
+          function loadIssueContext() {
+            const contextPath = path.join(process.cwd(), '.issue-context.json');
+            if (fs.existsSync(contextPath)) {
+              return JSON.parse(fs.readFileSync(contextPath, 'utf-8'));
+            }
+            return {};
+          }
+
+          async function main() {
+            console.log('🚀 Starting Code Generation with Azure OpenAI...');
+            const issueContext = loadIssueContext();
+            const issueTitle = process.env.ISSUE_TITLE || '';
+            const issueBody = process.env.ISSUE_BODY || '';
+
+            console.log(`📝 Issue: ${issueTitle}`);
+
+            const systemPrompt = `You are an expert code generation AI assistant. Your task is to:
+1. Analyze GitHub issues and requirements
+2. Generate production-ready code based on the requirements
+3. Follow best practices and coding conventions
+4. Include appropriate comments and documentation
+5. Provide code in JSON format with file structure
+
+IMPORTANT: Respond ONLY with valid JSON in this format:
+{
+  "files": [
+    {
+      "path": "path/to/file.extension",
+      "content": "file content here"
+    }
+  ],
+  "summary": "Brief summary of changes",
+  "notes": "Any important implementation notes"
+}`;
+
+            const userPrompt = `Please analyze the following GitHub issue and generate the necessary code:\n\n**Issue Title:** ${issueTitle}\n\n**Issue Description:**\n${issueBody}\n\n**Context:**\n- Issue Type: ${issueContext.type || 'unknown'}\n- Tech Stack: ${issueContext.techStack?.join(', ') || 'generic'}\n- Acceptance Criteria: ${issueContext.acceptanceCriteria?.join('; ') || 'none specified'}\n\nGenerate production-ready code that addresses this issue. Include all necessary files.`;
+
+            const messages = [
+              { role: 'system', content: systemPrompt },
+              { role: 'user', content: userPrompt },
+            ];
+
+            console.log('🔄 Calling Azure OpenAI GPT-4o...');
+            const response = await callAzureOpenAI(messages);
+            const generatedContent = response.choices[0].message.content;
+            console.log('✅ Code generation completed');
+
+            let codeData;
+            try {
+              codeData = JSON.parse(generatedContent);
+            } catch (parseError) {
+              const jsonMatch = generatedContent.match(/\{[\s\S]*\}/);
+              if (jsonMatch) {
+                codeData = JSON.parse(jsonMatch[0]);
+              } else {
+                throw new Error('Could not parse code generation response as JSON');
+              }
+            }
+
+            fs.writeFileSync(
+              path.join(process.cwd(), '.generated-code.json'),
+              JSON.stringify(codeData, null, 2)
+            );
+
+            console.log('\n📦 Generated Files:');
+            (codeData.files || []).forEach((file) => {
+              console.log(`  - ${file.path}`);
+            });
+
+            console.log(`\n📝 Summary: ${codeData.summary || 'Code generated successfully'}`);
+            if (codeData.notes) {
+              console.log(`📌 Notes: ${codeData.notes}`);
+            }
+          }
+
+          main().catch((error) => {
+            console.error('❌ Code generation failed:', error.message);
+            console.error('Stack:', error.stack);
+            process.exit(1);
+          });
+          NODE
         env:
           ISSUE_TITLE: ${{ github.event.issue.title }}
           ISSUE_BODY: ${{ github.event.issue.body }}
           ISSUE_NUMBER: ${{ github.event.issue.number }}
+          AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          AZURE_OPENAI_KEY: ${{ secrets.AZURE_OPENAI_KEY }}
+          GPT4O_DEPLOYMENT: ${{ env.GPT4O_DEPLOYMENT }}
 
       # Create feature branch
       - name: Create Feature Branch
@@ -73,10 +300,44 @@ jobs:
       # Write generated code to files
       - name: Write Code to Files
         run: |
-          node scripts/write-generated-files.js "${{ steps.code-generation.outputs.generated_code }}" "${{ steps.code-generation.outputs.files_list }}"
-        env:
-          GENERATED_CODE: ${{ steps.code-generation.outputs.generated_code }}
-          FILES_LIST: ${{ steps.code-generation.outputs.files_list }}
+          node <<'NODE'
+          const fs = require('fs');
+          const path = require('path');
+
+          const generatedCodePath = path.join(process.cwd(), '.generated-code.json');
+          if (!fs.existsSync(generatedCodePath)) {
+            console.log('⚠️  No generated code found. Skipping file writing.');
+            process.exit(0);
+          }
+
+          const codeData = JSON.parse(fs.readFileSync(generatedCodePath, 'utf-8'));
+          if (!codeData.files || codeData.files.length === 0) {
+            console.log('⚠️  No files to write in generated code.');
+            process.exit(0);
+          }
+
+          let filesWritten = 0;
+          const repoRoot = process.cwd();
+          for (const file of codeData.files) {
+            const filePath = path.join(repoRoot, file.path);
+            if (!path.resolve(filePath).startsWith(path.resolve(repoRoot))) {
+              console.warn(`⚠️  Skipping file ${file.path} (outside repo root)`);
+              continue;
+            }
+            console.log(`📄 Writing: ${file.path}`);
+            const dir = path.dirname(filePath);
+            fs.mkdirSync(dir, { recursive: true });
+            fs.writeFileSync(filePath, file.content, 'utf-8');
+            filesWritten += 1;
+          }
+
+          console.log(`\n✅ Successfully wrote ${filesWritten} file(s)`);
+          fs.unlinkSync(generatedCodePath);
+          const contextPath = path.join(repoRoot, '.issue-context.json');
+          if (fs.existsSync(contextPath)) {
+            fs.unlinkSync(contextPath);
+          }
+          NODE
 
       # Commit changes
       - name: Commit Changes

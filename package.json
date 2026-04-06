@@ -2,11 +2,6 @@
   "name": "Github_Azure_foundry-automation",
   "version": "1.0.0",
   "description": "GitHub issue-to-code automation using Azure OpenAI and GitHub Actions",
-  "scripts": {
-    "extract-issue": "node scripts/extract-issue.js",
-    "generate-code": "node scripts/generate-code.js",
-    "write-files": "node scripts/write-generated-files.js"
-  },
   "keywords": [
     "github",
     "azure",

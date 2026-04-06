@@ -105,15 +105,12 @@ Should we make it consistent?
 ### Setup Requirements
 
 ```bash
-# 1. Install dependencies
-npm install
-
-# 2. Deploy infrastructure
+# 1. Deploy infrastructure
 cd /path/to/repo
 terraform init
 terraform apply
 
-# 3. Get credentials
+# 2. Get credentials
 terraform output
 
 # 4. Configure GitHub Secrets
@@ -270,7 +267,7 @@ A: Yes! Set up separate GitHub workflows for each project/repository.
 A: Add more capacity in Azure Portal or implement rate limiting.
 
 **Q: Can I customize the generated code style?**
-A: Yes, modify the system prompt in `scripts/generate-code.js`.
+A: Yes, modify the system prompt in `.github/workflows/auto-code-generation.yml`.
 
 ---
 
