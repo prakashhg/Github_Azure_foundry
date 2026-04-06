@@ -22,30 +22,19 @@ GitHub issue-to-code automation using Azure OpenAI and GitHub Actions.
 └── workflows/
     └── auto-code-generation.yml    # Main GitHub Actions workflow
 
-main.tf                              # Azure infrastructure
-variables.tf                         # Terraform variables
-outputs.tf                          # Terraform outputs
-providers.tf                        # Azure provider config
 package.json                        # Optional Node metadata
 ```
 
 ## 🚀 Quick Start
 
-### 1. Deploy Azure Infrastructure
-```bash
-terraform init
-terraform plan
-terraform apply
-```
-
-### 2. Configure GitHub Secrets
+### 1. Configure GitHub Secrets
 Go to your repository: **Settings → Secrets and variables → Actions**
 
-Add secrets from Terraform output:
+Add secrets from your existing Azure OpenAI resource:
 - `AZURE_OPENAI_ENDPOINT`
 - `AZURE_OPENAI_KEY`
 
-### 3. Test the System
+### 2. Test the System
 Create a GitHub issue in your repository with the label `auto fix`, `auto-fix`, or `autofix`, or add one of those labels after creating the issue.
 
 > The workflow is configured to run only when the issue is created with the trigger label or when that label is attached later.
@@ -71,7 +60,6 @@ Issue Auto-Closed
 ## 🔧 Technology Stack
 
 - **Cloud:** Microsoft Azure
-- **IaC:** Terraform
 - **Automation:** GitHub Actions
 - **AI/ML:** Azure OpenAI (GPT-4o)
 - **Runtime:** Node.js 18+

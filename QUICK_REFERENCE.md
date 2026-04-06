@@ -105,20 +105,12 @@ Should we make it consistent?
 ### Setup Requirements
 
 ```bash
-# 1. Deploy infrastructure
-cd /path/to/repo
-terraform init
-terraform apply
-
-# 2. Get credentials
-terraform output
-
-# 4. Configure GitHub Secrets
+# 1. Configure GitHub Secrets
 # Go to: Settings → Secrets and variables → Actions
 # Add: AZURE_OPENAI_ENDPOINT and AZURE_OPENAI_KEY
 
-# 5. Test with a sample issue
-# Create a GitHub issue in your repo
+# 2. Test with a sample issue
+# Create a GitHub issue with label auto fix / auto-fix / autofix
 ```
 
 ### Debugging Workflow Issues
@@ -237,12 +229,10 @@ In Azure Portal:
 **Tools:**
 - [Azure Portal](https://portal.azure.com/)
 - [GitHub Repository](https://github.com)
-- [Terraform Registry](https://registry.terraform.io/)
 
 **External Docs:**
 - [Azure OpenAI Docs](https://learn.microsoft.com/en-us/azure/ai-services/openai/)
 - [GitHub Actions Reference](https://docs.github.com/en/actions/reference)
-- [Terraform Azure Provider](https://registry.terraform.io/providers/hashicorp/azurerm/latest/docs)
 
 ---
 

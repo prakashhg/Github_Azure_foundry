@@ -21,46 +21,17 @@ This system automates code generation for GitHub issues using Azure OpenAI (GPT-
 
 ---
 
-## 🔧 Step 1: Deploy Azure Infrastructure
+## 🔧 Step 1: Use Your Existing Azure OpenAI Resource
 
-### 1.1 Initialize and Deploy Terraform
+This repository assumes Azure OpenAI is already provisioned and available.
 
-```bash
-# Navigate to your project directory
-cd /workspaces/Github_Azure_foundry
+### 1.1 Get credentials from your existing Azure OpenAI instance
 
-# Initialize Terraform (downloads providers)
-terraform init
+From the Azure Portal or your own secret store, capture:
+- `AZURE_OPENAI_ENDPOINT`
+- `AZURE_OPENAI_KEY`
 
-# Validate configuration
-terraform validate
-
-# Plan deployment (review what will be created)
-terraform plan -out=tfplan
-
-# Apply the plan (creates Azure resources)
-terraform apply tfplan
-```
-
-### 1.2 Retrieve Azure OpenAI Credentials
-
-After deployment, get the credentials:
-
-```bash
-# Show all outputs
-terraform output
-
-# Save specific values for GitHub Secrets
-terraform output -raw azure_openai_endpoint
-terraform output -raw azure_openai_key
-```
-
-**Example Output:**
-```
-azure_openai_endpoint = "https://openai-foundry-xxx.openai.azure.com/"
-azure_openai_key = "abc123...xyz789"
-gpt4o_deployment_name = "gpt4o-code-gen"
-```
+If your Azure OpenAI deployment uses a custom name, record the deployment ID as well.
 
 ---
 
@@ -77,8 +48,8 @@ GitHub Secrets protect sensitive credentials. Add these to your repository:
 
 | Secret Name | Value | Source |
 |------------|-------|--------|
-| `AZURE_OPENAI_ENDPOINT` | Azure OpenAI endpoint URL | `terraform output azure_openai_endpoint` |
-| `AZURE_OPENAI_KEY` | Azure OpenAI API key | `terraform output azure_openai_key` |
+| `AZURE_OPENAI_ENDPOINT` | Azure OpenAI endpoint URL | From your existing Azure OpenAI instance |
+| `AZURE_OPENAI_KEY` | Azure OpenAI API key | From your existing Azure OpenAI instance |
 
 ### 2.2 Via GitHub CLI (Command Line)
 
@@ -183,16 +154,7 @@ Close Original Issue
 ├── workflows/
 │   └── auto-code-generation.yml    # Main GitHub Actions workflow
 
-main.tf                              # Azure Foundry + OpenAI infrastructure
-variables.tf                         # Terraform variables
-outputs.tf                           # Exposed values
-providers.tf                         # Provider configuration
-```
-
-main.tf                              # Azure Foundry + OpenAI infrastructure
-variables.tf                         # Terraform variables
-outputs.tf                          # Exposed values
-providers.tf                         # Provider configuration
+package.json                        # Optional Node metadata
 ```
 
 ---
@@ -319,8 +281,7 @@ Add step to `.github/workflows/auto-code-generation.yml`:
 The system uses `gpt-4o-2024-08-06`. To use a different model:
 
 1. Deploy new model in Azure OpenAI
-2. Update Terraform: `model_version = "new-version"`
-3. Update workflow: `GPT4O_DEPLOYMENT = "your-deployment"`
+2. Update workflow: `GPT4O_DEPLOYMENT = "your-deployment"`
 
 ---
 
@@ -345,9 +306,8 @@ az costmanagement query create \
 
 ## ✅ Verification Checklist
 
-- [ ] Terraform deployment successful
-- [ ] Azure resources created (check Azure Portal)
-- [ ] GitHub Secrets configured (AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_KEY)
+- [ ] Azure OpenAI instance exists and is reachable
+- [ ] GitHub Secrets configured (`AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_KEY`)
 - [ ] `.github/workflows/auto-code-generation.yml` exists
 - [ ] Test issue created and workflow runs successfully
 - [ ] PR generated with code
@@ -359,13 +319,12 @@ az costmanagement query create \
 
 - **Azure OpenAI Docs:** https://learn.microsoft.com/en-us/azure/ai-services/openai/
 - **GitHub Actions Docs:** https://docs.github.com/en/actions
-- **Terraform Docs:** https://registry.terraform.io/providers/hashicorp/azurerm/latest
 
 ---
 
 ## 🎯 Next Steps
 
-1. ✅ Deploy infrastructure with Terraform
+1. ✅ Confirm existing Azure OpenAI instance
 2. ✅ Configure GitHub Secrets
 3. ✅ Create test issue
 4. ✅ Verify workflow execution
