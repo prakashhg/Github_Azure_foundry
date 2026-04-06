@@ -46,7 +46,9 @@ Add secrets from Terraform output:
 - `AZURE_OPENAI_KEY`
 
 ### 3. Test the System
-Create a GitHub issue in your repository, and the automation runs automatically!
+Create a GitHub issue in your repository with the label `auto fix` or add the `auto fix` label after creating the issue.
+
+> The workflow is configured to run only when the issue is created with the `auto fix` label or when that label is attached later.
 
 ## 📖 How It Works
 
