@@ -1,2 +1,35 @@
 node_modules/
 .env
+.env.local
+package-lock.json
+
+# Terraform
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+.terraform.lock.hcl
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Generated/Temporary files (GitHub Actions)
+.issue-context.json
+.generated-code.json
+
+# Build artifacts
+dist/
+build/
+out/
+
+# Logs
+*.log
+logs/

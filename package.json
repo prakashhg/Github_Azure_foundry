@@ -1,13 +1,21 @@
 {
-  "name": "Github_Azure_foundry-node-hello",
+  "name": "Github_Azure_foundry-automation",
   "version": "1.0.0",
-  "description": "Simple Node.js Hello World project added to the repository",
-  "main": "index.js",
+  "description": "GitHub issue-to-code automation using Azure OpenAI and GitHub Actions",
   "scripts": {
-    "start": "node index.js",
-    "test": "echo \"No tests configured\" && exit 0"
+    "extract-issue": "node scripts/extract-issue.js",
+    "generate-code": "node scripts/generate-code.js",
+    "write-files": "node scripts/write-generated-files.js"
   },
-  "keywords": ["nodejs", "hello-world"],
+  "keywords": [
+    "github",
+    "azure",
+    "openai",
+    "automation",
+    "gpt4o",
+    "codegen",
+    "github-actions"
+  ],
   "author": "prakashhg",
   "license": "MIT"
 }
