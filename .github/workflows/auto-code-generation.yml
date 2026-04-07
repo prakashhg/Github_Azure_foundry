@@ -11,68 +11,127 @@ permissions:
 
 jobs:
   auto-fix:
+    name: Analyze Issue and Auto Fix
     runs-on: ubuntu-latest
 
+    # Run only when label "autofix" exists
     if: >
+      github.event.issue.labels &&
       contains(join(github.event.issue.labels.*.name, ','), 'autofix')
 
     steps:
+      # -------------------------------------------------
+      # 1. Checkout repository
+      # -------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # -------------------------------------------------
+      # 2. Extract issue details
+      # -------------------------------------------------
       - name: Extract issue details
-        id: issue
         run: |
-          echo "TITLE<<EOF" >> $GITHUB_ENV
+          echo "ISSUE_NUMBER=${{ github.event.issue.number }}" >> $GITHUB_ENV
+
+          echo "ISSUE_TITLE<<EOF" >> $GITHUB_ENV
           echo "${{ github.event.issue.title }}" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
 
-          echo "BODY<<EOF" >> $GITHUB_ENV
+          echo "ISSUE_BODY<<EOF" >> $GITHUB_ENV
           echo "${{ github.event.issue.body }}" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
 
+      # -------------------------------------------------
+      # 3. Call Azure OpenAI (capture HTTP status)
+      # -------------------------------------------------
       - name: Call Azure OpenAI
-        id: ai
         env:
-          AZURE_OPENAI_KEY: ${{ secrets.AZURE_OPENAI_KEY }}
           AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          AZURE_OPENAI_KEY: ${{ secrets.AZURE_OPENAI_KEY }}
         run: |
-          curl -s "${AZURE_OPENAI_ENDPOINT}/openai/deployments/gpt-4o/chat/completions?api-version=2024-02-15-preview" \
+          echo "Calling Azure OpenAI..."
+
+          HTTP_CODE=$(curl -s -o ai-response.json -w "%{http_code}" \
+            "$AZURE_OPENAI_ENDPOINT/openai/deployments/gpt-4o/chat/completions?api-version=2024-02-15-preview" \
             -H "Content-Type: application/json" \
             -H "api-key: $AZURE_OPENAI_KEY" \
             -d "{
-              \"messages\": [{
-                \"role\": \"user\",
-                \"content\": \"You are a senior engineer. Generate code for this issue. Respond ONLY in JSON with files[]. Issue: $TITLE $BODY\"
-              }]
-            }" \
-          | jq -r '.choices[0].message.content' > result.json
+              \"messages\": [
+                { \"role\": \"system\", \"content\": \"You are a senior software engineer.\" },
+                {
+                  \"role\": \"user\",
+                  \"content\": \"Generate production-ready code for the GitHub issue below. Respond ONLY in valid JSON.\\n\\nFORMAT:\\n{ \\\"files\\\": [{ \\\"path\\\": \\\"path/file.ext\\\", \\\"content\\\": \\\"code\\\" }], \\\"summary\\\": \\\"summary\\\", \\\"notes\\\": \\\"notes\\\" }\\n\\nISSUE TITLE:\\n$ISSUE_TITLE\\n\\nISSUE DESCRIPTION:\\n$ISSUE_BODY\"
+                }
+              ]
+            }")
 
+          echo "HTTP_CODE=$HTTP_CODE" >> $GITHUB_ENV
+
+          cat ai-response.json
+
+      # -------------------------------------------------
+      # 4. ✅ VALIDATION STEP (FAIL FAST)
+      # -------------------------------------------------
+      - name: Validate Azure OpenAI response
+        run: |
+          echo "Validating Azure OpenAI response..."
+
+          # Check HTTP response
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "❌ Azure OpenAI call failed with HTTP $HTTP_CODE"
+            exit 1
+          fi
+
+          # Extract model response
+          jq -e '.choices[0].message.content' ai-response.json > result.json
+
+          # Validate JSON format
+          if ! jq -e '.files | length > 0' result.json > /dev/null; then
+            echo "❌ Invalid or empty AI response"
+            exit 1
+          fi
+
+          echo "✅ Azure OpenAI call successful and response valid"
+
+      # -------------------------------------------------
+      # 5. Write generated files
+      # -------------------------------------------------
       - name: Write generated files
         run: |
           jq -c '.files[]' result.json | while read file; do
-            path=$(echo "$file" | jq -r '.path')
-            content=$(echo "$file" | jq -r '.content')
+            FILE_PATH=$(echo "$file" | jq -r '.path')
+            FILE_CONTENT=$(echo "$file" | jq -r '.content')
 
-            mkdir -p "$(dirname "$path")"
-            echo "$content" > "$path"
+            mkdir -p "$(dirname "$FILE_PATH")"
+            echo "$FILE_CONTENT" > "$FILE_PATH"
           done
 
-      - name: Create branch and commit
+      # -------------------------------------------------
+      # 6. Create branch, commit, and push
+      # -------------------------------------------------
+      - name: Create branch and commit changes
         run: |
-          git checkout -b auto/issue-${{ github.event.issue.number }}
-          git add .
-          git commit -m "Auto-fix issue #${{ github.event.issue.number }}"
-          git push origin auto/issue-${{ github.event.issue.number }}
+          BRANCH="auto-fix/issue-$ISSUE_NUMBER"
 
-      - name: Create PR and close issue
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          git checkout -b "$BRANCH"
+          git add .
+          git commit -m "Auto-fix for issue #$ISSUE_NUMBER"
+          git push origin "$BRANCH"
+
+      # -------------------------------------------------
+      # 7. Create PR and close issue
+      # -------------------------------------------------
+      - name: Create Pull Request and close issue
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh pr create \
-            --title "Auto fix: $TITLE" \
-            --body "Generated by Azure OpenAI" \
+            --title "Auto fix: $ISSUE_TITLE" \
+            --body "This PR was automatically generated by Azure OpenAI for issue #$ISSUE_NUMBER." \
             --base main \
-            --head auto/issue-${{ github.event.issue.number }}
+            --head "auto-fix/issue-$ISSUE_NUMBER"
 
-          gh issue close ${{ github.event.issue.number }}
+          gh issue close "$ISSUE_NUMBER" --comment "✅ Issue fixed and PR created."
