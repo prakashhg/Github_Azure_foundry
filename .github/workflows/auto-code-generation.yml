@@ -1,11 +1,8 @@
-name: Autofix using Azure OpenAI
+name: Auto Code Generation with Azure OpenAI
 
 on:
   issues:
-    types:
-      - opened
-      - labeled
-      - push
+    types: [opened, labeled]
 
 permissions:
   contents: write
@@ -13,171 +10,69 @@ permissions:
   issues: write
 
 jobs:
-  autofix:
+  auto-fix:
     runs-on: ubuntu-latest
 
+    if: >
+      contains(join(github.event.issue.labels.*.name, ','), 'autofix')
+
     steps:
-      # --------------------------------------------------
-      # 1. Debug: prove workflow triggered
-      # --------------------------------------------------
-      - name: Debug trigger
-        run: |
-          echo "✅ Workflow triggered"
-          echo "Action: ${{ github.event.action }}"
-          echo "Issue number: ${{ github.event.issue.number }}"
-          echo "Issue title: ${{ github.event.issue.title }}"
-          echo "Labels: ${{ join(github.event.issue.labels.*.name, ', ') }}"
-
-      # --------------------------------------------------
-      # 2. Gate: run only if label = autofix
-      # --------------------------------------------------
-      - name: Check autofix label
-        id: gate
-        run: |
-          LABELS="${{ join(github.event.issue.labels.*.name, ',') }}"
-          if [[ "$LABELS" == *"autofix"* ]]; then
-            echo "run=true" >> $GITHUB_OUTPUT
-          else
-            echo "run=false" >> $GITHUB_OUTPUT
-          fi
-
-      - name: Exit if not autofix
-        if: steps.gate.outputs.run != 'true'
-        run: |
-          echo "ℹ️ Not an autofix issue. Exiting."
-          exit 0
-
-      # --------------------------------------------------
-      # 3. Checkout repository
-      # --------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # --------------------------------------------------
-      # 4. Create feature branch
-      # --------------------------------------------------
-      - name: Create feature branch
+      - name: Extract issue details
+        id: issue
         run: |
-          BRANCH="autofix/issue-${{ github.event.issue.number }}"
-          echo "BRANCH=$BRANCH" >> $GITHUB_ENV
-          git checkout -b "$BRANCH"
+          echo "TITLE<<EOF" >> $GITHUB_ENV
+          echo "${{ github.event.issue.title }}" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
 
-      # --------------------------------------------------
-      # 5. Call Azure OpenAI (no agents)
-      # --------------------------------------------------
+          echo "BODY<<EOF" >> $GITHUB_ENV
+          echo "${{ github.event.issue.body }}" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
       - name: Call Azure OpenAI
+        id: ai
         env:
-          AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
           AZURE_OPENAI_KEY: ${{ secrets.AZURE_OPENAI_KEY }}
-          AZURE_OPENAI_DEPLOYMENT: ${{ secrets.AZURE_OPENAI_DEPLOYMENT }}
+          AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
         run: |
-          PROMPT=$(cat <<'EOF'
-Return ONLY valid JSON. No markdown. No explanations. No backticks.
-
-JSON FORMAT:
-{
-  "files": [
-    {
-      "path": "relative/path/to/file",
-      "content": "full file content"
-    }
-  ],
-  "summary": "short summary"
-}
-
-ISSUE TITLE:
-${{ github.event.issue.title }}
-
-ISSUE BODY:
-${{ github.event.issue.body }}
-EOF
-)
-
-          PAYLOAD=$(jq -n \
-            --arg prompt "$PROMPT" \
-            '{
-              messages: [
-                { "role": "user", "content": $prompt }
-              ],
-              temperature: 0.2
-            }')
-
-          curl -s "$AZURE_OPENAI_ENDPOINT/openai/deployments/$AZURE_OPENAI_DEPLOYMENT/chat/completions?api-version=2024-02-01" \
+          curl -s "${AZURE_OPENAI_ENDPOINT}/openai/deployments/gpt-4o/chat/completions?api-version=2024-02-15-preview" \
             -H "Content-Type: application/json" \
             -H "api-key: $AZURE_OPENAI_KEY" \
-            -d "$PAYLOAD" \
-            | jq -r '.choices[0].message.content' > raw.json
+            -d "{
+              \"messages\": [{
+                \"role\": \"user\",
+                \"content\": \"You are a senior engineer. Generate code for this issue. Respond ONLY in JSON with files[]. Issue: $TITLE $BODY\"
+              }]
+            }" \
+          | jq -r '.choices[0].message.content' > result.json
 
-      # --------------------------------------------------
-      # 6. Sanitize AI output
-      # --------------------------------------------------
-      - name: Sanitize AI response
-        run: |
-          sed 's/^```json//g; s/^```//g; s/```$//g' raw.json > result.json
-          echo "AI Response:"
-          cat result.json
-
-      # --------------------------------------------------
-      # 7. Validate and write files
-      # --------------------------------------------------
       - name: Write generated files
         run: |
-          set -e
-
-          jq -e '.files' result.json >/dev/null
-
-          FILE_COUNT=$(jq '.files | length' result.json)
-          if [ "$FILE_COUNT" -eq 0 ]; then
-            echo "ℹ️ No files generated. Exiting."
-            exit 0
-          fi
-
           jq -c '.files[]' result.json | while read file; do
-            FILE_PATH=$(echo "$file" | jq -r '.path')
-            FILE_CONTENT=$(echo "$file" | jq -r '.content')
+            path=$(echo "$file" | jq -r '.path')
+            content=$(echo "$file" | jq -r '.content')
 
-            mkdir -p "$(dirname "$FILE_PATH")"
-            echo "$FILE_CONTENT" > "$FILE_PATH"
-            echo "✅ Created $FILE_PATH"
+            mkdir -p "$(dirname "$path")"
+            echo "$content" > "$path"
           done
 
-      # --------------------------------------------------
-      # 8. Commit and push changes
-      # --------------------------------------------------
-      - name: Commit changes
+      - name: Create branch and commit
         run: |
-          git config user.name "autofix-bot"
-          git config user.email "autofix@github.com"
+          git checkout -b auto/issue-${{ github.event.issue.number }}
           git add .
-          git commit -m "autofix: issue #${{ github.event.issue.number }}"
-          git push origin "$BRANCH"
+          git commit -m "Auto-fix issue #${{ github.event.issue.number }}"
+          git push origin auto/issue-${{ github.event.issue.number }}
 
-      # --------------------------------------------------
-      # 9. Create Pull Request
-      # --------------------------------------------------
-      - name: Create Pull Request
-        uses: actions/github-script@v7
-        with:
-          script: |
-            await github.rest.pulls.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              head: process.env.BRANCH,
-              base: "main",
-              title: `Autofix: Issue #${context.issue.number}`,
-              body: `✅ Auto-generated code\n\nCloses #${context.issue.number}`
-            });
+      - name: Create PR and close issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr create \
+            --title "Auto fix: $TITLE" \
+            --body "Generated by Azure OpenAI" \
+            --base main \
+            --head auto/issue-${{ github.event.issue.number }}
 
-      # --------------------------------------------------
-      # 10. Close the issue
-      # --------------------------------------------------
-      - name: Close issue
-        uses: actions/github-script@v7
-        with:
-          script: |
-            await github.rest.issues.update({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              state: "closed"
-            });
+          gh issue close ${{ github.event.issue.number }}
