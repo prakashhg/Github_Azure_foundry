@@ -1,16 +1,11 @@
 {
-  "name": "Github_Azure_foundry-automation",
+  "name": "my-node-app",
   "version": "1.0.0",
-  "description": "GitHub issue-to-code automation using Azure OpenAI and GitHub Actions",
-  "keywords": [
-    "github",
-    "azure",
-    "openai",
-    "automation",
-    "gpt4o",
-    "codegen",
-    "github-actions"
-  ],
-  "author": "prakashhg",
-  "license": "MIT"
+  "description": "A simple Node.js application",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "author": "",
+  "license": "ISC"
 }
