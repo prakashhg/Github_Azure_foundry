@@ -51,15 +51,6 @@ jobs:
 
           ok_labels = {"autofix", "auto-fix", "auto fix"}
 
-          if action == "opened":
-            should_run = any(x in label_set for x in ok_labels)
-            reason = f"opened: labels={sorted(label_set)}"
-          elif action == "labeled":
-            should_run = (added_norm in ok_labels) or any(x in label_set for x in ok_labels)
-            reason = f"labeled: added={added_norm}, labels={sorted(label_set)}"
-          else:
-            should_run = False
-            reason = f"action={action} not handled"
 
           out_path = os.environ["GITHUB_OUTPUT"]
           with open(out_path, "a", encoding="utf-8") as out:
