@@ -21,8 +21,8 @@ jobs:
     steps:
       # ------------------------------------------------------------
       # 0) Guard + Debug (ALWAYS RUNS)
-      #    - Prevents job from being "skipped"
-      #    - Makes decision in a step and prints labels clearly
+      #    This prevents the job itself from being "skipped".
+      #    All other steps are gated by guard output.
       # ------------------------------------------------------------
       - name: Guard (run only if label is autofix)
         id: guard
@@ -41,34 +41,26 @@ jobs:
           labels = issue.get("labels") or []
           label_names = [(l.get("name","") or "") for l in labels]
 
-          # label from labeled event
           added_label = ""
           if action == "labeled":
             added_label = ((ev.get("label") or {}).get("name") or "")
 
-          # Normalize: lowercase + trim
           def norm(s): return s.strip().lower()
-
           label_set = set(norm(x) for x in label_names if x)
           added_norm = norm(added_label)
 
-          # Accept label variants
           ok_labels = {"autofix", "auto-fix", "auto fix"}
-
-          should_run = False
-          reason = ""
 
           if action == "opened":
             should_run = any(x in label_set for x in ok_labels)
             reason = f"opened: labels={sorted(label_set)}"
           elif action == "labeled":
-            should_run = added_norm in ok_labels or any(x in label_set for x in ok_labels)
+            should_run = (added_norm in ok_labels) or any(x in label_set for x in ok_labels)
             reason = f"labeled: added={added_norm}, labels={sorted(label_set)}"
           else:
             should_run = False
             reason = f"action={action} not handled"
 
-          # Write outputs
           out_path = os.environ["GITHUB_OUTPUT"]
           with open(out_path, "a", encoding="utf-8") as out:
             out.write(f"run={'true' if should_run else 'false'}\n")
@@ -83,11 +75,21 @@ jobs:
       - name: Debug event summary
         shell: bash
         run: |
-          echo "action:        ${{ steps.guard.outputs.action }}"
-          echo "added_label:   ${{ steps.guard.outputs.added_label }}"
-          echo "all_labels:    ${{ steps.guard.outputs.labels }}"
-          echo "decision:      ${{ steps.guard.outputs.run }}"
-          echo "reason:        ${{ steps.guard.outputs.reason }}"
+          echo "action:      ${{ steps.guard.outputs.action }}"
+          echo "added_label: ${{ steps.guard.outputs.added_label }}"
+          echo "all_labels:  ${{ steps.guard.outputs.labels }}"
+          echo "decision:    ${{ steps.guard.outputs.run }}"
+          echo "reason:      ${{ steps.guard.outputs.reason }}"
+
+      # Optional: comment on issue if label missing (helps users)
+      - name: Comment when not eligible (missing label)
+        if: steps.guard.outputs.run != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          gh issue comment ${{ github.event.issue.number }} \
+            --body "⚠️ Auto-fix did not start because this issue does not have the required label. Add label **autofix** to trigger automation."
 
       # ------------------------------------------------------------
       # Everything below runs ONLY when guard says run=true
@@ -103,6 +105,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           echo "ISSUE_NUMBER=${{ github.event.issue.number }}" >> $GITHUB_ENV
 
           echo "ISSUE_TITLE<<EOF" >> $GITHUB_ENV
@@ -115,7 +118,8 @@ jobs:
 
       # ------------------------------------------------------------
       # Call Azure OpenAI (retry + capture HTTP)
-      # writes payload/response/result to RUNNER_TEMP (NOT committed)
+      # FIXED: No more KeyError: PAYLOAD (Python gets payload path as argument)
+      # Writes files into RUNNER_TEMP so they are NOT committed.
       # ------------------------------------------------------------
       - name: Call Azure OpenAI (retry + capture HTTP)
         if: steps.guard.outputs.run == 'true'
@@ -151,13 +155,14 @@ jobs:
           }
           JSON
 
-          python3 - <<'PY'
-          import json, os
-          payload = os.environ["PAYLOAD"]
+          # Inject issue data safely (pass payload path as argument)
+          python3 - "$PAYLOAD" <<'PY'
+          import json, os, sys
+          payload = sys.argv[1]
           with open(payload, "r", encoding="utf-8") as f:
             data = json.load(f)
-          title = os.environ.get("ISSUE_TITLE","")
-          body  = os.environ.get("ISSUE_BODY","")
+          title = os.environ.get("ISSUE_TITLE", "")
+          body  = os.environ.get("ISSUE_BODY", "")
           data["messages"][1]["content"] = data["messages"][1]["content"].replace("__TITLE__", title).replace("__BODY__", body)
           with open(payload, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
@@ -186,7 +191,7 @@ jobs:
           echo "RESULT=$RESULT" >> $GITHUB_ENV
 
       # ------------------------------------------------------------
-      # Validate Azure response (fail-fast = RED + stop)
+      # Validate Azure response (Fail Fast = RED + stop)
       # ------------------------------------------------------------
       - name: Validate Azure OpenAI response (fail fast)
         if: steps.guard.outputs.run == 'true'
@@ -196,6 +201,7 @@ jobs:
 
           if [ "${HTTP_CODE}" -ne 200 ]; then
             echo "❌ Azure OpenAI call failed with HTTP ${HTTP_CODE}"
+            echo "Response (truncated):"
             head -c 2000 "$AI_RESP" || true
             exit 1
           fi
@@ -217,7 +223,7 @@ jobs:
           try:
             result = json.loads(content)
           except Exception as e:
-            print("❌ Model output is not valid JSON:", e)
+            print("❌ Model did not return valid JSON:", e)
             print(content[:2000])
             sys.exit(1)
 
@@ -229,11 +235,11 @@ jobs:
           with open(result_path, "w", encoding="utf-8") as f:
             json.dump(result, f, ensure_ascii=False, indent=2)
 
-          print("✅ Azure response valid JSON with files[]")
+          print("✅ Azure response valid JSON with non-empty files[]")
           PY
 
       # ------------------------------------------------------------
-      # Write files safely
+      # Write generated files safely (block workflow edits + traversal)
       # ------------------------------------------------------------
       - name: Write generated files safely
         if: steps.guard.outputs.run == 'true'
@@ -253,7 +259,7 @@ jobs:
             content = item.get("content","")
 
             if not isinstance(path, str) or not path.strip():
-              print("❌ Invalid path")
+              print("❌ Invalid file path")
               sys.exit(1)
 
             if path.startswith(("/", "\\")) or ".." in path.split("/"):
@@ -268,17 +274,20 @@ jobs:
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
             with open(path, "w", encoding="utf-8") as wf:
               wf.write(content)
+
             print(f"Wrote: {path}")
           PY
 
       # ------------------------------------------------------------
-      # Branch + commit + push (handles existing remote branch)
+      # Branch + commit + push (handles existing branch)
+      # Fixes non-fast-forward using --force-with-lease
       # ------------------------------------------------------------
       - name: Create branch and commit changes
         if: steps.guard.outputs.run == 'true'
         shell: bash
         run: |
           set -euo pipefail
+
           BRANCH="auto-fix/issue-$ISSUE_NUMBER"
 
           git config user.name "github-actions"
@@ -305,10 +314,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           BRANCH="auto-fix/issue-$ISSUE_NUMBER"
 
           if gh pr view --head "$BRANCH" >/dev/null 2>&1; then
-            echo "✅ PR already exists for $BRANCH. Skipping creation."
+            echo "✅ PR already exists for $BRANCH. Skipping PR creation."
           else
             gh pr create \
               --title "Auto fix: $ISSUE_TITLE" \
