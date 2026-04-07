@@ -9,28 +9,31 @@ permissions:
   pull-requests: write
   issues: write
 
+concurrency:
+  group: autofix-issue-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
 jobs:
   auto-fix:
-    name: Analyze Issue and Auto Fix
+    name: Analyze Issue → Generate Code → PR → Close Issue
     runs-on: ubuntu-latest
 
-    # Run only when label "autofix" exists
+    # Runs ONLY when the issue has label "autofix"
     if: >
       github.event.issue.labels &&
       contains(join(github.event.issue.labels.*.name, ','), 'autofix')
 
     steps:
-      # -------------------------------------------------
-      # 1. Checkout repository
-      # -------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      # -------------------------------------------------
-      # 2. Extract issue details
-      # -------------------------------------------------
       - name: Extract issue details
+        shell: bash
         run: |
+          set -euo pipefail
+
           echo "ISSUE_NUMBER=${{ github.event.issue.number }}" >> $GITHUB_ENV
 
           echo "ISSUE_TITLE<<EOF" >> $GITHUB_ENV
@@ -41,76 +44,193 @@ jobs:
           echo "${{ github.event.issue.body }}" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
 
-      # -------------------------------------------------
-      # 3. Call Azure OpenAI (capture HTTP status)
-      # -------------------------------------------------
-      - name: Call Azure OpenAI
+      # ------------------------------------------------------------
+      # Call Azure OpenAI (with retry) and capture HTTP + response body
+      # ------------------------------------------------------------
+      - name: Call Azure OpenAI (retry + capture HTTP)
         env:
           AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
           AZURE_OPENAI_KEY: ${{ secrets.AZURE_OPENAI_KEY }}
+          AZURE_OPENAI_DEPLOYMENT: ${{ secrets.AZURE_OPENAI_DEPLOYMENT }}
+        shell: bash
         run: |
-          echo "Calling Azure OpenAI..."
+          set -euo pipefail
 
-          HTTP_CODE=$(curl -s -o ai-response.json -w "%{http_code}" \
-            "$AZURE_OPENAI_ENDPOINT/openai/deployments/gpt-4o/chat/completions?api-version=2024-02-15-preview" \
-            -H "Content-Type: application/json" \
-            -H "api-key: $AZURE_OPENAI_KEY" \
-            -d "{
-              \"messages\": [
-                { \"role\": \"system\", \"content\": \"You are a senior software engineer.\" },
-                {
-                  \"role\": \"user\",
-                  \"content\": \"Generate production-ready code for the GitHub issue below. Respond ONLY in valid JSON.\\n\\nFORMAT:\\n{ \\\"files\\\": [{ \\\"path\\\": \\\"path/file.ext\\\", \\\"content\\\": \\\"code\\\" }], \\\"summary\\\": \\\"summary\\\", \\\"notes\\\": \\\"notes\\\" }\\n\\nISSUE TITLE:\\n$ISSUE_TITLE\\n\\nISSUE DESCRIPTION:\\n$ISSUE_BODY\"
-                }
-              ]
-            }")
+          # Mask the key (extra safety)
+          echo "::add-mask::$AZURE_OPENAI_KEY"
+
+          # Normalize endpoint (remove trailing slash if present)
+          ENDPOINT="${AZURE_OPENAI_ENDPOINT%/}"
+          URL="$ENDPOINT/openai/deployments/$AZURE_OPENAI_DEPLOYMENT/chat/completions?api-version=2024-02-15-preview"
+
+          # Build prompt (we force JSON output contract)
+          cat > payload.json <<'JSON'
+          {
+            "temperature": 0.2,
+            "messages": [
+              {
+                "role": "system",
+                "content": "You are a senior software engineer. Output ONLY valid JSON. No markdown. No explanations."
+              },
+              {
+                "role": "user",
+                "content": "Generate production-ready code for the GitHub issue below.\n\nReturn ONLY JSON in this exact schema:\n{\n  \"files\": [\n    {\"path\": \"relative/path/to/file.ext\", \"content\": \"file content\"}\n  ],\n  \"summary\": \"short summary\",\n  \"notes\": \"important notes\"\n}\n\nRules:\n- files must be a NON-EMPTY array\n- paths must be relative (no leading /)\n- do not use .. in paths\n- do not modify .github/workflows/* or secrets\n\nISSUE TITLE:\n__TITLE__\n\nISSUE DESCRIPTION:\n__BODY__\n"
+              }
+            ]
+          }
+          JSON
+
+          # Safely inject issue title/body using Python (avoids quoting problems)
+          python3 - <<'PY'
+          import json, os
+          with open("payload.json","r",encoding="utf-8") as f:
+              data=json.load(f)
+          title=os.environ.get("ISSUE_TITLE","")
+          body=os.environ.get("ISSUE_BODY","")
+          content=data["messages"][1]["content"].replace("__TITLE__", title).replace("__BODY__", body)
+          data["messages"][1]["content"]=content
+          with open("payload.json","w",encoding="utf-8") as f:
+              json.dump(data,f,ensure_ascii=False)
+          PY
+
+          # Retry logic (your deployment rate limit can be ~1 request / 10 sec)
+          attempts=3
+          HTTP_CODE="000"
+
+          for i in $(seq 1 $attempts); do
+            echo "Calling Azure OpenAI (attempt $i/$attempts)..."
+
+            HTTP_CODE=$(curl -sS -o ai-response.json -w "%{http_code}" \
+              "$URL" \
+              -H "Content-Type: application/json" \
+              -H "api-key: $AZURE_OPENAI_KEY" \
+              --data-binary @payload.json || true)
+
+            echo "HTTP_CODE=$HTTP_CODE"
+
+            if [ "$HTTP_CODE" -eq 200 ]; then
+              break
+            fi
+
+            echo "Waiting 12 seconds before retry..."
+            sleep 12
+          done
 
           echo "HTTP_CODE=$HTTP_CODE" >> $GITHUB_ENV
 
-          cat ai-response.json
-
-      # -------------------------------------------------
-      # 4. ✅ VALIDATION STEP (FAIL FAST)
-      # -------------------------------------------------
-      - name: Validate Azure OpenAI response
+      # ------------------------------------------------------------
+      # Fail fast if Azure call failed OR response is not usable JSON
+      # ------------------------------------------------------------
+      - name: Validate Azure OpenAI response (fail fast)
+        shell: bash
         run: |
-          echo "Validating Azure OpenAI response..."
+          set -euo pipefail
 
-          # Check HTTP response
-          if [ "$HTTP_CODE" -ne 200 ]; then
-            echo "❌ Azure OpenAI call failed with HTTP $HTTP_CODE"
+          if [ "${HTTP_CODE}" -ne 200 ]; then
+            echo "❌ Azure OpenAI call failed with HTTP ${HTTP_CODE}"
+            echo "Response (truncated):"
+            head -c 2000 ai-response.json || true
             exit 1
           fi
 
-          # Extract model response
-          jq -e '.choices[0].message.content' ai-response.json > result.json
+          # Extract message.content and validate JSON using Python (more reliable than jq for escaped content)
+          python3 - <<'PY'
+          import json, sys
 
-          # Validate JSON format
-          if ! jq -e '.files | length > 0' result.json > /dev/null; then
-            echo "❌ Invalid or empty AI response"
-            exit 1
-          fi
+          with open("ai-response.json","r",encoding="utf-8") as f:
+              raw=json.load(f)
 
-          echo "✅ Azure OpenAI call successful and response valid"
+          # Basic structure checks
+          try:
+              content = raw["choices"][0]["message"]["content"]
+          except Exception:
+              print("❌ Missing choices[0].message.content in Azure response")
+              sys.exit(1)
 
-      # -------------------------------------------------
-      # 5. Write generated files
-      # -------------------------------------------------
-      - name: Write generated files
+          # content should be JSON text
+          try:
+              result = json.loads(content)
+          except Exception as e:
+              print("❌ Model did not return valid JSON.")
+              print("Error:", e)
+              print("Raw content (first 2000 chars):", content[:2000])
+              sys.exit(1)
+
+          # Validate schema
+          if not isinstance(result, dict):
+              print("❌ JSON root is not an object")
+              sys.exit(1)
+
+          files = result.get("files")
+          if not isinstance(files, list) or len(files) == 0:
+              print("❌ JSON missing non-empty files[]")
+              sys.exit(1)
+
+          # Save parsed result.json for next steps
+          with open("result.json","w",encoding="utf-8") as f:
+              json.dump(result,f,ensure_ascii=False,indent=2)
+
+          print("✅ Azure response is valid JSON with non-empty files[]")
+          PY
+
+      # ------------------------------------------------------------
+      # Write files safely (block path traversal + block workflow edits)
+      # ------------------------------------------------------------
+      - name: Write generated files safely
+        shell: bash
         run: |
-          jq -c '.files[]' result.json | while read file; do
-            FILE_PATH=$(echo "$file" | jq -r '.path')
-            FILE_CONTENT=$(echo "$file" | jq -r '.content')
+          set -euo pipefail
 
-            mkdir -p "$(dirname "$FILE_PATH")"
-            echo "$FILE_CONTENT" > "$FILE_PATH"
-          done
+          python3 - <<'PY'
+          import json, os, sys
 
-      # -------------------------------------------------
-      # 6. Create branch, commit, and push
-      # -------------------------------------------------
+          with open("result.json","r",encoding="utf-8") as f:
+              result=json.load(f)
+
+          blocked_prefixes = [
+              ".github/workflows/",   # protect CI
+              ".git/",                # protect git internals
+          ]
+
+          for item in result["files"]:
+              path=item.get("path","")
+              content=item.get("content","")
+
+              if not path or not isinstance(path,str):
+                  print("❌ Invalid file path")
+                  sys.exit(1)
+
+              # Enforce safe relative paths
+              if path.startswith("/") or path.startswith("\\"):
+                  print(f"❌ Absolute paths not allowed: {path}")
+                  sys.exit(1)
+
+              if ".." in path.split("/"):
+                  print(f"❌ Path traversal not allowed: {path}")
+                  sys.exit(1)
+
+              # Block protected areas
+              for bp in blocked_prefixes:
+                  if path.startswith(bp):
+                      print(f"❌ Writing to protected path blocked: {path}")
+                      sys.exit(1)
+
+              # Create dirs and write file
+              os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+              with open(path,"w",encoding="utf-8") as wf:
+                  wf.write(content)
+
+              print(f"Wrote: {path}")
+          PY
+
+      # ------------------------------------------------------------
+      # Create branch, commit, push (fail if no changes)
+      # ------------------------------------------------------------
       - name: Create branch and commit changes
+        shell: bash
         run: |
+          set -euo pipefail
+
           BRANCH="auto-fix/issue-$ISSUE_NUMBER"
 
           git config user.name "github-actions"
@@ -118,20 +238,30 @@ jobs:
 
           git checkout -b "$BRANCH"
           git add .
+
+          if git diff --cached --quiet; then
+            echo "❌ No changes produced by AI. Failing to avoid empty PR."
+            exit 1
+          fi
+
           git commit -m "Auto-fix for issue #$ISSUE_NUMBER"
           git push origin "$BRANCH"
 
-      # -------------------------------------------------
-      # 7. Create PR and close issue
-      # -------------------------------------------------
-      - name: Create Pull Request and close issue
+      # ------------------------------------------------------------
+      # Create PR and close issue
+      # ------------------------------------------------------------
+      - name: Create PR and close issue
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
         run: |
+          set -euo pipefail
+          BRANCH="auto-fix/issue-$ISSUE_NUMBER"
+
           gh pr create \
             --title "Auto fix: $ISSUE_TITLE" \
             --body "This PR was automatically generated by Azure OpenAI for issue #$ISSUE_NUMBER." \
             --base main \
-            --head "auto-fix/issue-$ISSUE_NUMBER"
+            --head "$BRANCH"
 
-          gh issue close "$ISSUE_NUMBER" --comment "✅ Issue fixed and PR created."
+          gh issue close "$ISSUE_NUMBER" --comment "✅ Issue fixed and PR created automatically."
