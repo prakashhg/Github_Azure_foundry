@@ -18,12 +18,27 @@ jobs:
     name: Issue → Azure OpenAI → Branch/Commit → PR → Close Issue
     runs-on: ubuntu-latest
 
-    # Only run when label "autofix" exists on the issue
+    # ✅ Robust gating:
+    # - If issue is opened and already has label, run
+    # - If label event added autofix, run
     if: >
-      github.event.issue.labels &&
-      contains(join(github.event.issue.labels.*.name, ','), 'autofix')
+      (github.event.action == 'opened' &&
+        github.event.issue.labels &&
+        contains(join(github.event.issue.labels.*.name, ','), 'autofix')
+      )
+      ||
+      (github.event.action == 'labeled' &&
+        github.event.label.name == 'autofix'
+      )
 
     steps:
+      - name: Debug trigger info (helps if it gets skipped)
+        shell: bash
+        run: |
+          echo "Action: ${{ github.event.action }}"
+          echo "Label (if labeled event): ${{ github.event.label.name }}"
+          echo "All labels: ${{ join(github.event.issue.labels.*.name, ',') }}"
+
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
@@ -45,7 +60,7 @@ jobs:
           echo "EOF" >> $GITHUB_ENV
 
       # ------------------------------------------------------------
-      # Call Azure OpenAI (retry + capture HTTP) - writes artifacts to RUNNER_TEMP
+      # Call Azure OpenAI (retry + capture HTTP) - artifacts go to RUNNER_TEMP
       # ------------------------------------------------------------
       - name: Call Azure OpenAI (retry + capture HTTP)
         env:
@@ -55,8 +70,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
-          # Mask key from logs
           echo "::add-mask::$AZURE_OPENAI_KEY"
 
           ENDPOINT="${AZURE_OPENAI_ENDPOINT%/}"
@@ -66,7 +79,6 @@ jobs:
           AI_RESP="$RUNNER_TEMP/ai-response.json"
           RESULT="$RUNNER_TEMP/result.json"
 
-          # Build payload template
           cat > "$PAYLOAD" <<'JSON'
           {
             "temperature": 0.2,
@@ -77,13 +89,12 @@ jobs:
               },
               {
                 "role": "user",
-                "content": "Generate production-ready code for the GitHub issue below.\n\nReturn ONLY JSON with this schema:\n{\n  \"files\": [\n    {\"path\": \"relative/path/to/file.ext\", \"content\": \"file content\"}\n  ],\n  \"summary\": \"short summary\",\n  \"notes\": \"important notes\"\n}\n\nRules:\n- files must be NON-EMPTY array\n- paths must be relative (no leading /)\n- no .. in paths\n- do not modify .github/workflows/*\n- do not output anything except JSON\n\nISSUE TITLE:\n__TITLE__\n\nISSUE BODY:\n__BODY__\n"
+                "content": "Generate production-ready code for the GitHub issue below.\n\nReturn ONLY JSON with this schema:\n{\n  \"files\": [\n    {\"path\": \"relative/path/to/file.ext\", \"content\": \"file content\"}\n  ],\n  \"summary\": \"short summary\",\n  \"notes\": \"important notes\"\n}\n\nRules:\n- files must be NON-EMPTY array\n- paths must be relative (no leading /)\n- no .. in paths\n- do not modify .github/workflows/*\n- output JSON only\n\nISSUE TITLE:\n__TITLE__\n\nISSUE BODY:\n__BODY__\n"
               }
             ]
           }
           JSON
 
-          # Inject issue data safely
           python3 - <<'PY'
           import json, os
           payload = os.environ["PAYLOAD"]
@@ -108,13 +119,8 @@ jobs:
               --data-binary @"$PAYLOAD" || true)
 
             echo "HTTP_CODE=$HTTP_CODE"
+            if [ "$HTTP_CODE" -eq 200 ]; then break; fi
 
-            # Success
-            if [ "$HTTP_CODE" -eq 200 ]; then
-              break
-            fi
-
-            # Respect low rate limits (you observed ~1 request / 10 sec)
             echo "Waiting 12 seconds before retry..."
             sleep 12
           done
@@ -125,24 +131,21 @@ jobs:
           echo "PAYLOAD=$PAYLOAD" >> $GITHUB_ENV
 
       # ------------------------------------------------------------
-      # Fail-fast validation (turn pipeline RED + stop)
+      # Fail-fast validation: if Azure call failed OR response invalid → RED + stop
       # ------------------------------------------------------------
       - name: Validate Azure OpenAI response (fail fast)
         shell: bash
         run: |
           set -euo pipefail
-          echo "Validating Azure OpenAI response..."
 
           if [ "${HTTP_CODE}" -ne 200 ]; then
             echo "❌ Azure OpenAI call failed with HTTP ${HTTP_CODE}"
-            echo "Response (truncated):"
             head -c 2000 "$AI_RESP" || true
             exit 1
           fi
 
           python3 - <<'PY'
           import json, os, sys
-
           ai_resp = os.environ["AI_RESP"]
           result_path = os.environ["RESULT"]
 
@@ -152,15 +155,14 @@ jobs:
           try:
               content = raw["choices"][0]["message"]["content"]
           except Exception:
-              print("❌ Missing choices[0].message.content in Azure response")
+              print("❌ Missing choices[0].message.content")
               sys.exit(1)
 
           try:
               result = json.loads(content)
           except Exception as e:
-              print("❌ Model did not return valid JSON.")
-              print("Error:", e)
-              print("Raw content (first 2000 chars):", content[:2000])
+              print("❌ Model did not return valid JSON:", e)
+              print(content[:2000])
               sys.exit(1)
 
           files = result.get("files")
@@ -171,20 +173,15 @@ jobs:
           with open(result_path, "w", encoding="utf-8") as f:
               json.dump(result, f, ensure_ascii=False, indent=2)
 
-          print("✅ Azure response valid JSON with non-empty files[]")
+          print("✅ Azure response OK")
           PY
 
-      # ------------------------------------------------------------
-      # Write generated files safely (block workflow edits + path traversal)
-      # ------------------------------------------------------------
       - name: Write generated files safely
         shell: bash
         run: |
           set -euo pipefail
-
           python3 - <<'PY'
           import json, os, sys
-
           result_path = os.environ["RESULT"]
           with open(result_path, "r", encoding="utf-8") as f:
               result = json.load(f)
@@ -196,21 +193,13 @@ jobs:
               content = item.get("content", "")
 
               if not isinstance(path, str) or not path.strip():
-                  print("❌ Invalid path in files[]")
+                  print("❌ Invalid path")
                   sys.exit(1)
 
-              # Relative paths only
-              if path.startswith("/") or path.startswith("\\"):
-                  print(f"❌ Absolute path blocked: {path}")
+              if path.startswith(("/", "\\")) or ".." in path.split("/"):
+                  print(f"❌ Unsafe path blocked: {path}")
                   sys.exit(1)
 
-              # Block traversal
-              parts = path.split("/")
-              if ".." in parts:
-                  print(f"❌ Path traversal blocked: {path}")
-                  sys.exit(1)
-
-              # Block workflow changes
               for bp in blocked_prefixes:
                   if path.startswith(bp):
                       print(f"❌ Protected path blocked: {path}")
@@ -219,27 +208,19 @@ jobs:
               os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
               with open(path, "w", encoding="utf-8") as wf:
                   wf.write(content)
-
               print(f"Wrote: {path}")
           PY
 
-      # ------------------------------------------------------------
-      # Create/update branch per issue, commit, push
-      # Fixes: non-fast-forward by using --force-with-lease
-      # ------------------------------------------------------------
-      - name: Create branch and commit changes
+      - name: Create branch and commit changes (handles existing remote branch)
         shell: bash
         run: |
           set -euo pipefail
-
           BRANCH="auto-fix/issue-$ISSUE_NUMBER"
 
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
 
-          # Create or reset the local branch to current HEAD
           git checkout -B "$BRANCH"
-
           git add .
 
           if git diff --cached --quiet; then
@@ -248,13 +229,8 @@ jobs:
           fi
 
           git commit -m "Auto-fix for issue #$ISSUE_NUMBER"
-
-          # Safe force push so branch updates even if it already exists remotely
           git push --force-with-lease origin "$BRANCH"
 
-      # ------------------------------------------------------------
-      # Create PR (or reuse existing), then close issue
-      # ------------------------------------------------------------
       - name: Create PR (or reuse existing) and close issue
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -264,11 +240,11 @@ jobs:
           BRANCH="auto-fix/issue-$ISSUE_NUMBER"
 
           if gh pr view --head "$BRANCH" >/dev/null 2>&1; then
-            echo "✅ PR already exists for $BRANCH. Skipping PR creation."
+            echo "✅ PR already exists for $BRANCH. Skipping creation."
           else
             gh pr create \
               --title "Auto fix: $ISSUE_TITLE" \
-              --body "This PR was automatically generated by Azure OpenAI for issue #$ISSUE_NUMBER." \
+              --body "Auto-generated by Azure OpenAI for issue #$ISSUE_NUMBER." \
               --base main \
               --head "$BRANCH"
           fi
