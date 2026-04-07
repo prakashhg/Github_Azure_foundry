@@ -15,10 +15,10 @@ concurrency:
 
 jobs:
   auto-fix:
-    name: Analyze Issue → Generate Code → PR → Close Issue
+    name: Issue → Azure OpenAI → Branch/Commit → PR → Close Issue
     runs-on: ubuntu-latest
 
-    # Runs ONLY when the issue has label "autofix"
+    # Only run when label "autofix" exists on the issue
     if: >
       github.event.issue.labels &&
       contains(join(github.event.issue.labels.*.name, ','), 'autofix')
@@ -45,7 +45,7 @@ jobs:
           echo "EOF" >> $GITHUB_ENV
 
       # ------------------------------------------------------------
-      # Call Azure OpenAI (with retry) and capture HTTP + response body
+      # Call Azure OpenAI (retry + capture HTTP) - writes artifacts to RUNNER_TEMP
       # ------------------------------------------------------------
       - name: Call Azure OpenAI (retry + capture HTTP)
         env:
@@ -56,15 +56,18 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Mask the key (extra safety)
+          # Mask key from logs
           echo "::add-mask::$AZURE_OPENAI_KEY"
 
-          # Normalize endpoint (remove trailing slash if present)
           ENDPOINT="${AZURE_OPENAI_ENDPOINT%/}"
           URL="$ENDPOINT/openai/deployments/$AZURE_OPENAI_DEPLOYMENT/chat/completions?api-version=2024-02-15-preview"
 
-          # Build prompt (we force JSON output contract)
-          cat > payload.json <<'JSON'
+          PAYLOAD="$RUNNER_TEMP/payload.json"
+          AI_RESP="$RUNNER_TEMP/ai-response.json"
+          RESULT="$RUNNER_TEMP/result.json"
+
+          # Build payload template
+          cat > "$PAYLOAD" <<'JSON'
           {
             "temperature": 0.2,
             "messages": [
@@ -74,80 +77,84 @@ jobs:
               },
               {
                 "role": "user",
-                "content": "Generate production-ready code for the GitHub issue below.\n\nReturn ONLY JSON in this exact schema:\n{\n  \"files\": [\n    {\"path\": \"relative/path/to/file.ext\", \"content\": \"file content\"}\n  ],\n  \"summary\": \"short summary\",\n  \"notes\": \"important notes\"\n}\n\nRules:\n- files must be a NON-EMPTY array\n- paths must be relative (no leading /)\n- do not use .. in paths\n- do not modify .github/workflows/* or secrets\n\nISSUE TITLE:\n__TITLE__\n\nISSUE DESCRIPTION:\n__BODY__\n"
+                "content": "Generate production-ready code for the GitHub issue below.\n\nReturn ONLY JSON with this schema:\n{\n  \"files\": [\n    {\"path\": \"relative/path/to/file.ext\", \"content\": \"file content\"}\n  ],\n  \"summary\": \"short summary\",\n  \"notes\": \"important notes\"\n}\n\nRules:\n- files must be NON-EMPTY array\n- paths must be relative (no leading /)\n- no .. in paths\n- do not modify .github/workflows/*\n- do not output anything except JSON\n\nISSUE TITLE:\n__TITLE__\n\nISSUE BODY:\n__BODY__\n"
               }
             ]
           }
           JSON
 
-          # Safely inject issue title/body using Python (avoids quoting problems)
+          # Inject issue data safely
           python3 - <<'PY'
           import json, os
-          with open("payload.json","r",encoding="utf-8") as f:
-              data=json.load(f)
-          title=os.environ.get("ISSUE_TITLE","")
-          body=os.environ.get("ISSUE_BODY","")
-          content=data["messages"][1]["content"].replace("__TITLE__", title).replace("__BODY__", body)
-          data["messages"][1]["content"]=content
-          with open("payload.json","w",encoding="utf-8") as f:
-              json.dump(data,f,ensure_ascii=False)
+          payload = os.environ["PAYLOAD"]
+          with open(payload, "r", encoding="utf-8") as f:
+              data = json.load(f)
+          title = os.environ.get("ISSUE_TITLE", "")
+          body = os.environ.get("ISSUE_BODY", "")
+          data["messages"][1]["content"] = data["messages"][1]["content"].replace("__TITLE__", title).replace("__BODY__", body)
+          with open(payload, "w", encoding="utf-8") as f:
+              json.dump(data, f, ensure_ascii=False)
           PY
 
-          # Retry logic (your deployment rate limit can be ~1 request / 10 sec)
           attempts=3
           HTTP_CODE="000"
 
           for i in $(seq 1 $attempts); do
-            echo "Calling Azure OpenAI (attempt $i/$attempts)..."
-
-            HTTP_CODE=$(curl -sS -o ai-response.json -w "%{http_code}" \
+            echo "Attempt $i/$attempts calling Azure OpenAI..."
+            HTTP_CODE=$(curl -sS -o "$AI_RESP" -w "%{http_code}" \
               "$URL" \
               -H "Content-Type: application/json" \
               -H "api-key: $AZURE_OPENAI_KEY" \
-              --data-binary @payload.json || true)
+              --data-binary @"$PAYLOAD" || true)
 
             echo "HTTP_CODE=$HTTP_CODE"
 
+            # Success
             if [ "$HTTP_CODE" -eq 200 ]; then
               break
             fi
 
+            # Respect low rate limits (you observed ~1 request / 10 sec)
             echo "Waiting 12 seconds before retry..."
             sleep 12
           done
 
           echo "HTTP_CODE=$HTTP_CODE" >> $GITHUB_ENV
+          echo "AI_RESP=$AI_RESP" >> $GITHUB_ENV
+          echo "RESULT=$RESULT" >> $GITHUB_ENV
+          echo "PAYLOAD=$PAYLOAD" >> $GITHUB_ENV
 
       # ------------------------------------------------------------
-      # Fail fast if Azure call failed OR response is not usable JSON
+      # Fail-fast validation (turn pipeline RED + stop)
       # ------------------------------------------------------------
       - name: Validate Azure OpenAI response (fail fast)
         shell: bash
         run: |
           set -euo pipefail
+          echo "Validating Azure OpenAI response..."
 
           if [ "${HTTP_CODE}" -ne 200 ]; then
             echo "❌ Azure OpenAI call failed with HTTP ${HTTP_CODE}"
             echo "Response (truncated):"
-            head -c 2000 ai-response.json || true
+            head -c 2000 "$AI_RESP" || true
             exit 1
           fi
 
-          # Extract message.content and validate JSON using Python (more reliable than jq for escaped content)
           python3 - <<'PY'
-          import json, sys
+          import json, os, sys
 
-          with open("ai-response.json","r",encoding="utf-8") as f:
-              raw=json.load(f)
+          ai_resp = os.environ["AI_RESP"]
+          result_path = os.environ["RESULT"]
 
-          # Basic structure checks
+          with open(ai_resp, "r", encoding="utf-8") as f:
+              raw = json.load(f)
+
           try:
               content = raw["choices"][0]["message"]["content"]
           except Exception:
               print("❌ Missing choices[0].message.content in Azure response")
               sys.exit(1)
 
-          # content should be JSON text
           try:
               result = json.loads(content)
           except Exception as e:
@@ -156,25 +163,19 @@ jobs:
               print("Raw content (first 2000 chars):", content[:2000])
               sys.exit(1)
 
-          # Validate schema
-          if not isinstance(result, dict):
-              print("❌ JSON root is not an object")
-              sys.exit(1)
-
           files = result.get("files")
           if not isinstance(files, list) or len(files) == 0:
               print("❌ JSON missing non-empty files[]")
               sys.exit(1)
 
-          # Save parsed result.json for next steps
-          with open("result.json","w",encoding="utf-8") as f:
-              json.dump(result,f,ensure_ascii=False,indent=2)
+          with open(result_path, "w", encoding="utf-8") as f:
+              json.dump(result, f, ensure_ascii=False, indent=2)
 
-          print("✅ Azure response is valid JSON with non-empty files[]")
+          print("✅ Azure response valid JSON with non-empty files[]")
           PY
 
       # ------------------------------------------------------------
-      # Write files safely (block path traversal + block workflow edits)
+      # Write generated files safely (block workflow edits + path traversal)
       # ------------------------------------------------------------
       - name: Write generated files safely
         shell: bash
@@ -184,47 +185,47 @@ jobs:
           python3 - <<'PY'
           import json, os, sys
 
-          with open("result.json","r",encoding="utf-8") as f:
-              result=json.load(f)
+          result_path = os.environ["RESULT"]
+          with open(result_path, "r", encoding="utf-8") as f:
+              result = json.load(f)
 
-          blocked_prefixes = [
-              ".github/workflows/",   # protect CI
-              ".git/",                # protect git internals
-          ]
+          blocked_prefixes = [".github/workflows/", ".git/"]
 
           for item in result["files"]:
-              path=item.get("path","")
-              content=item.get("content","")
+              path = item.get("path", "")
+              content = item.get("content", "")
 
-              if not path or not isinstance(path,str):
-                  print("❌ Invalid file path")
+              if not isinstance(path, str) or not path.strip():
+                  print("❌ Invalid path in files[]")
                   sys.exit(1)
 
-              # Enforce safe relative paths
+              # Relative paths only
               if path.startswith("/") or path.startswith("\\"):
-                  print(f"❌ Absolute paths not allowed: {path}")
+                  print(f"❌ Absolute path blocked: {path}")
                   sys.exit(1)
 
-              if ".." in path.split("/"):
-                  print(f"❌ Path traversal not allowed: {path}")
+              # Block traversal
+              parts = path.split("/")
+              if ".." in parts:
+                  print(f"❌ Path traversal blocked: {path}")
                   sys.exit(1)
 
-              # Block protected areas
+              # Block workflow changes
               for bp in blocked_prefixes:
                   if path.startswith(bp):
-                      print(f"❌ Writing to protected path blocked: {path}")
+                      print(f"❌ Protected path blocked: {path}")
                       sys.exit(1)
 
-              # Create dirs and write file
               os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-              with open(path,"w",encoding="utf-8") as wf:
+              with open(path, "w", encoding="utf-8") as wf:
                   wf.write(content)
 
               print(f"Wrote: {path}")
           PY
 
       # ------------------------------------------------------------
-      # Create branch, commit, push (fail if no changes)
+      # Create/update branch per issue, commit, push
+      # Fixes: non-fast-forward by using --force-with-lease
       # ------------------------------------------------------------
       - name: Create branch and commit changes
         shell: bash
@@ -236,7 +237,9 @@ jobs:
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
 
-          git checkout -b "$BRANCH"
+          # Create or reset the local branch to current HEAD
+          git checkout -B "$BRANCH"
+
           git add .
 
           if git diff --cached --quiet; then
@@ -245,12 +248,14 @@ jobs:
           fi
 
           git commit -m "Auto-fix for issue #$ISSUE_NUMBER"
-          git push origin "$BRANCH"
+
+          # Safe force push so branch updates even if it already exists remotely
+          git push --force-with-lease origin "$BRANCH"
 
       # ------------------------------------------------------------
-      # Create PR and close issue
+      # Create PR (or reuse existing), then close issue
       # ------------------------------------------------------------
-      - name: Create PR and close issue
+      - name: Create PR (or reuse existing) and close issue
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
@@ -258,10 +263,14 @@ jobs:
           set -euo pipefail
           BRANCH="auto-fix/issue-$ISSUE_NUMBER"
 
-          gh pr create \
-            --title "Auto fix: $ISSUE_TITLE" \
-            --body "This PR was automatically generated by Azure OpenAI for issue #$ISSUE_NUMBER." \
-            --base main \
-            --head "$BRANCH"
+          if gh pr view --head "$BRANCH" >/dev/null 2>&1; then
+            echo "✅ PR already exists for $BRANCH. Skipping PR creation."
+          else
+            gh pr create \
+              --title "Auto fix: $ISSUE_TITLE" \
+              --body "This PR was automatically generated by Azure OpenAI for issue #$ISSUE_NUMBER." \
+              --base main \
+              --head "$BRANCH"
+          fi
 
-          gh issue close "$ISSUE_NUMBER" --comment "✅ Issue fixed and PR created automatically."
+          gh issue close "$ISSUE_NUMBER" --comment "✅ Issue fixed and PR created/updated automatically."
