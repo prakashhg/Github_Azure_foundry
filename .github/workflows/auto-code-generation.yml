@@ -1,10 +1,11 @@
-name: Auto Code Generation with Azure OpenAI
+name: Auto Code Generation with Azure OpenAI (OIDC)
 
 on:
   issues:
-    types: [opened, labeled]
+    types: [labeled]  # ✅ Only one run when label is added
 
 permissions:
+  id-token: write          # ✅ Required for OIDC token in GitHub Actions [3](https://christosgalano.github.io/github-actions-permissions/)
   contents: write
   pull-requests: write
   issues: write
@@ -15,84 +16,36 @@ concurrency:
 
 jobs:
   auto-fix:
-    name: Issue → Azure OpenAI → Branch/Commit → PR → Close Issue
+    name: Issue → Azure OpenAI (OIDC) → Branch/Commit → PR → Close Issue
     runs-on: ubuntu-latest
 
     steps:
       # ------------------------------------------------------------
-      # 0) Guard + Debug (ALWAYS RUNS)
-      #    - Prevents whole job from being "skipped"
-      #    - All other steps run only if guard says run=true
+      # 0) Guard: Only proceed when label is autofix (case-insensitive)
       # ------------------------------------------------------------
       - name: Guard (run only if label is autofix)
         id: guard
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import json, os
+          LABEL="${{ github.event.label.name }}"
+          LABEL_LOWER="$(echo "$LABEL" | tr '[:upper:]' '[:lower:]')"
+          echo "Action: ${{ github.event.action }}"
+          echo "Label:  $LABEL_LOWER"
+          echo "Issue:  #${{ github.event.issue.number }}"
+          echo "Actor:  ${{ github.actor }}"
 
-          event_path = os.environ["GITHUB_EVENT_PATH"]
-          with open(event_path, "r", encoding="utf-8") as f:
-            ev = json.load(f)
+          if [[ "$LABEL_LOWER" != "autofix" && "$LABEL_LOWER" != "auto-fix" && "$LABEL_LOWER" != "auto fix" ]]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "Not an autofix label. Exiting successfully."
+            exit 0
+          fi
 
-          action = (ev.get("action") or "").strip().lower()
-          issue = ev.get("issue") or {}
-          labels = issue.get("labels") or []
-          label_names = [(l.get("name","") or "") for l in labels]
-
-          added_label = ""
-          if action == "labeled":
-            added_label = ((ev.get("label") or {}).get("name") or "")
-
-          def norm(s): return s.strip().lower()
-          label_set = set(norm(x) for x in label_names if x)
-          added_norm = norm(added_label)
-
-          ok_labels = {"autofix", "auto-fix", "auto fix"}
-
-          if action == "opened":
-            should_run = any(x in label_set for x in ok_labels)
-            reason = f"opened: labels={sorted(label_set)}"
-          elif action == "labeled":
-            should_run = (added_norm in ok_labels) or any(x in label_set for x in ok_labels)
-            reason = f"labeled: added={added_norm}, labels={sorted(label_set)}"
-          else:
-            should_run = False
-            reason = f"action={action} not handled"
-
-          out_path = os.environ["GITHUB_OUTPUT"]
-          with open(out_path, "a", encoding="utf-8") as out:
-            out.write(f"run={'true' if should_run else 'false'}\n")
-            out.write(f"action={action}\n")
-            out.write(f"added_label={added_norm}\n")
-            out.write("labels=" + ",".join(sorted(label_set)) + "\n")
-            out.write(f"reason={reason}\n")
-
-          print(f"Guard decision run={should_run} | {reason}")
-          PY
-
-      - name: Debug event summary
-        shell: bash
-        run: |
-          echo "action:      ${{ steps.guard.outputs.action }}"
-          echo "added_label: ${{ steps.guard.outputs.added_label }}"
-          echo "all_labels:  ${{ steps.guard.outputs.labels }}"
-          echo "decision:    ${{ steps.guard.outputs.run }}"
-          echo "reason:      ${{ steps.guard.outputs.reason }}"
-
-      # Optional (helpful): comment on issue when label missing
-      - name: Comment when not eligible (missing label)
-        if: steps.guard.outputs.run != 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
-        run: |
-          gh issue comment ${{ github.event.issue.number }} \
-            --body "⚠️ Auto-fix did not start because this issue does not have the required label. Add label **autofix** (or auto-fix / auto fix) to trigger automation."
+          echo "run=true" >> "$GITHUB_OUTPUT"
+          echo "Autofix label detected. Proceeding..."
 
       # ------------------------------------------------------------
-      # Everything below runs ONLY when guard says run=true
+      # 1) Checkout
       # ------------------------------------------------------------
       - name: Checkout repository
         if: steps.guard.outputs.run == 'true'
@@ -100,12 +53,26 @@ jobs:
         with:
           fetch-depth: 0
 
+      # ------------------------------------------------------------
+      # 2) Azure Login via OIDC (no client secret)
+      # ------------------------------------------------------------
+      - name: Azure Login (OIDC)
+        if: steps.guard.outputs.run == 'true'
+        uses: azure/login@v2
+        with:
+          client-id:       ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        # This exchanges GitHub OIDC token for Azure access token via federation [2](https://github.com/github/docs/blob/main/content/repositories/managing-your-repositorys-settings-and-features/enabling-features-for-your-repository/managing-github-actions-settings-for-a-repository.md)[3](https://christosgalano.github.io/github-actions-permissions/)
+
+      # ------------------------------------------------------------
+      # 3) Extract issue details
+      # ------------------------------------------------------------
       - name: Extract issue details
         if: steps.guard.outputs.run == 'true'
         shell: bash
         run: |
           set -euo pipefail
-
           echo "ISSUE_NUMBER=${{ github.event.issue.number }}" >> $GITHUB_ENV
 
           echo "ISSUE_TITLE<<EOF" >> $GITHUB_ENV
@@ -117,23 +84,24 @@ jobs:
           echo "EOF" >> $GITHUB_ENV
 
       # ------------------------------------------------------------
-      # Call Azure OpenAI (retry + capture HTTP)
-      # FIXED: No KeyError PAYLOAD (Python receives payload path as argument)
-      # All artifacts are in RUNNER_TEMP (not committed)
+      # 4) Call Azure OpenAI using Entra ID token (Bearer)
       # ------------------------------------------------------------
-      - name: Call Azure OpenAI (retry + capture HTTP)
+      - name: Call Azure OpenAI (OIDC bearer token)
         if: steps.guard.outputs.run == 'true'
         env:
-          AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
-          AZURE_OPENAI_KEY: ${{ secrets.AZURE_OPENAI_KEY }}
+          AZURE_OPENAI_ENDPOINT:   ${{ secrets.AZURE_OPENAI_ENDPOINT }}
           AZURE_OPENAI_DEPLOYMENT: ${{ secrets.AZURE_OPENAI_DEPLOYMENT }}
         shell: bash
         run: |
           set -euo pipefail
-          echo "::add-mask::$AZURE_OPENAI_KEY"
 
           ENDPOINT="${AZURE_OPENAI_ENDPOINT%/}"
-          URL="$ENDPOINT/openai/deployments/$AZURE_OPENAI_DEPLOYMENT/chat/completions?api-version=2024-02-15-preview"
+          DEPLOYMENT="$AZURE_OPENAI_DEPLOYMENT"
+          URL="$ENDPOINT/openai/deployments/$DEPLOYMENT/chat/completions?api-version=2024-02-15-preview"
+
+          # Acquire access token for Azure Cognitive Services scope (RBAC)
+          # This is how Entra ID auth is used for Azure OpenAI inference calls [4](https://github.com/peter-evans/create-pull-request)[5](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/enabling-features-for-your-repository/managing-github-actions-settings-for-a-repository)
+          TOKEN="$(az account get-access-token --resource https://cognitiveservices.azure.com/ --query accessToken -o tsv)"
 
           PAYLOAD="$RUNNER_TEMP/payload.json"
           AI_RESP="$RUNNER_TEMP/ai-response.json"
@@ -149,49 +117,37 @@ jobs:
               },
               {
                 "role": "user",
-                "content": "Generate production-ready code for the GitHub issue below.\n\nReturn ONLY JSON with this schema:\n{\n  \"files\": [\n    {\"path\": \"relative/path/to/file.ext\", \"content\": \"file content\"}\n  ],\n  \"summary\": \"short summary\",\n  \"notes\": \"important notes\"\n}\n\nRules:\n- Output JSON only (no markdown)\n- files must be NON-EMPTY array\n- Paths must be relative (no leading /) and must not contain '..'\n- Repo has NO Dockerfile unless explicitly requested. Do NOT create Dockerfile.\n- You MAY modify existing CI workflows under .github/workflows/ BUT you MUST NOT modify .github/workflows/auto-code-generation.yml\n- Do NOT create NEW workflow files; only update existing ones if needed\n\nISSUE TITLE:\n__TITLE__\n\nISSUE BODY:\n__BODY__\n"
+                "content": "Generate production-ready code for the GitHub issue below.\n\nReturn ONLY JSON with this schema:\n{\n  \"files\": [\n    {\"path\": \"relative/path/to/file.ext\", \"content\": \"file content\"}\n  ],\n  \"summary\": \"short summary\",\n  \"notes\": \"important notes\"\n}\n\nRules:\n- Output JSON only (no markdown)\n- files must be NON-EMPTY array\n- Paths must be relative (no leading /) and must not contain '..'\n- Do NOT modify .github/workflows/auto-code-generation.yml\n- You MAY update existing workflows under .github/workflows/ (like ci.yml) but MUST NOT create new workflow files\n\nISSUE TITLE:\n__TITLE__\n\nISSUE BODY:\n__BODY__\n"
               }
             ]
           }
           JSON
 
-          # Inject issue data safely (pass payload path as argument)
           python3 - "$PAYLOAD" <<'PY'
           import json, os, sys
           payload = sys.argv[1]
           with open(payload, "r", encoding="utf-8") as f:
             data = json.load(f)
-          title = os.environ.get("ISSUE_TITLE", "")
-          body  = os.environ.get("ISSUE_BODY", "")
+          title = os.environ.get("ISSUE_TITLE","")
+          body  = os.environ.get("ISSUE_BODY","")
           data["messages"][1]["content"] = data["messages"][1]["content"].replace("__TITLE__", title).replace("__BODY__", body)
           with open(payload, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
           PY
 
-          attempts=3
-          HTTP_CODE="000"
-
-          for i in $(seq 1 $attempts); do
-            echo "Attempt $i/$attempts calling Azure OpenAI..."
-            HTTP_CODE=$(curl -sS -o "$AI_RESP" -w "%{http_code}" \
-              "$URL" \
-              -H "Content-Type: application/json" \
-              -H "api-key: $AZURE_OPENAI_KEY" \
-              --data-binary @"$PAYLOAD" || true)
-
-            echo "HTTP_CODE=$HTTP_CODE"
-            if [ "$HTTP_CODE" -eq 200 ]; then break; fi
-
-            echo "Waiting 12 seconds before retry..."
-            sleep 12
-          done
+          # Call AOAI with Bearer token (OIDC → Azure token exchange already done by azure/login)
+          HTTP_CODE="$(curl -sS -o "$AI_RESP" -w "%{http_code}" \
+            "$URL" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $TOKEN" \
+            --data-binary @"$PAYLOAD" || true)"
 
           echo "HTTP_CODE=$HTTP_CODE" >> $GITHUB_ENV
           echo "AI_RESP=$AI_RESP" >> $GITHUB_ENV
           echo "RESULT=$RESULT" >> $GITHUB_ENV
 
       # ------------------------------------------------------------
-      # Validate Azure response (Fail Fast = RED + stop)
+      # 5) Validate Azure response (fail-fast = RED)
       # ------------------------------------------------------------
       - name: Validate Azure OpenAI response (fail fast)
         if: steps.guard.outputs.run == 'true'
@@ -201,7 +157,6 @@ jobs:
 
           if [ "${HTTP_CODE}" -ne 200 ]; then
             echo "❌ Azure OpenAI call failed with HTTP ${HTTP_CODE}"
-            echo "Response (truncated):"
             head -c 2000 "$AI_RESP" || true
             exit 1
           fi
@@ -239,12 +194,12 @@ jobs:
           PY
 
       # ------------------------------------------------------------
-      # Write generated files safely:
-      # - blocks traversal & absolute paths
-      # - blocks .git/*
-      # - blocks changes to THIS workflow file
-      # - allows editing existing .github/workflows/* (like ci.yml)
-      # - blocks creating NEW workflow files
+      # 6) Write generated files safely
+      #    - blocks traversal/absolute paths
+      #    - blocks .git/*
+      #    - blocks changing this workflow
+      #    - allows editing existing workflow files
+      #    - blocks creating new workflow files
       # ------------------------------------------------------------
       - name: Write generated files safely
         if: steps.guard.outputs.run == 'true'
@@ -262,7 +217,6 @@ jobs:
             ".github/workflows/auto-code-generation.yml",
             ".github/workflows/auto-code-generation.yaml"
           }
-
           blocked_prefixes = [".git/"]
 
           for item in result["files"]:
@@ -273,28 +227,24 @@ jobs:
               print("❌ Invalid file path")
               sys.exit(1)
 
-            # Absolute path blocked
             if path.startswith(("/", "\\")):
               print(f"❌ Absolute path blocked: {path}")
               sys.exit(1)
 
-            # Path traversal blocked
             if ".." in path.split("/"):
               print(f"❌ Path traversal blocked: {path}")
               sys.exit(1)
 
-            # Block exact forbidden files
             if path in blocked_exact:
               print(f"❌ Protected file blocked: {path}")
               sys.exit(1)
 
-            # Block forbidden prefixes
             for bp in blocked_prefixes:
               if path.startswith(bp):
                 print(f"❌ Protected path blocked: {path}")
                 sys.exit(1)
 
-            # If it's a workflow file, allow only if it already exists (no new workflow creation)
+            # If it is a workflow file, allow only if it already exists
             if path.startswith(".github/workflows/") and not os.path.exists(path):
               print(f"❌ Creating new workflow files is blocked: {path}")
               sys.exit(1)
@@ -307,63 +257,13 @@ jobs:
           PY
 
       # ------------------------------------------------------------
-      # Optional but recommended:
-      # Install deps to generate correct lockfile when issue asks to install packages
-      # ------------------------------------------------------------
-      - name: Detect package manager
-        if: steps.guard.outputs.run == 'true'
-        id: pm
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [ -f "pnpm-lock.yaml" ]; then
-            echo "manager=pnpm" >> "$GITHUB_OUTPUT"
-          elif [ -f "yarn.lock" ]; then
-            echo "manager=yarn" >> "$GITHUB_OUTPUT"
-          else
-            echo "manager=npm" >> "$GITHUB_OUTPUT"
-          fi
-          echo "Detected package manager: $(cat $GITHUB_OUTPUT | tail -n 1)"
-
-      - name: Setup Node (use .nvmrc if present)
-        if: steps.guard.outputs.run == 'true' && hashFiles('.nvmrc') != ''
-        uses: actions/setup-node@v4
-        with:
-          node-version-file: .nvmrc
-
-      - name: Setup Node (fallback to 22)
-        if: steps.guard.outputs.run == 'true' && hashFiles('.nvmrc') == ''
-        uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-
-      - name: Install dependencies (update lockfile when needed)
-        if: steps.guard.outputs.run == 'true' && hashFiles('package.json') != ''
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [ "${{ steps.pm.outputs.manager }}" = "pnpm" ]; then
-            corepack enable
-            pnpm install --frozen-lockfile=false
-          elif [ "${{ steps.pm.outputs.manager }}" = "yarn" ]; then
-            corepack enable
-            # Updates lockfile if dependencies changed
-            yarn install --mode update-lockfile
-          else
-            npm install
-          fi
-
-      # ------------------------------------------------------------
-      # Branch + commit + push
-      # - handles existing remote branch via --force-with-lease
+      # 7) Branch + commit + push (safe even if branch exists remotely)
       # ------------------------------------------------------------
       - name: Create branch and commit changes
         if: steps.guard.outputs.run == 'true'
         shell: bash
         run: |
           set -euo pipefail
-
           BRANCH="auto-fix/issue-$ISSUE_NUMBER"
 
           git config user.name "github-actions"
@@ -381,7 +281,7 @@ jobs:
           git push --force-with-lease origin "$BRANCH"
 
       # ------------------------------------------------------------
-      # PR create/reuse + close issue
+      # 8) PR create/reuse + close issue
       # ------------------------------------------------------------
       - name: Create PR (or reuse existing) and close issue
         if: steps.guard.outputs.run == 'true'
@@ -390,7 +290,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           BRANCH="auto-fix/issue-$ISSUE_NUMBER"
 
           if gh pr view --head "$BRANCH" >/dev/null 2>&1; then
@@ -398,7 +297,7 @@ jobs:
           else
             gh pr create \
               --title "Auto fix: $ISSUE_TITLE" \
-              --body "Auto-generated by Azure OpenAI for issue #$ISSUE_NUMBER." \
+              --body "Auto-generated by Azure OpenAI (OIDC) for issue #$ISSUE_NUMBER." \
               --base main \
               --head "$BRANCH"
           fi
