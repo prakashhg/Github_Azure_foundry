@@ -2,7 +2,9 @@ name: Autofix using Azure OpenAI
 
 on:
   issues:
-    types: [opened, labeled]
+    types:
+      - opened
+      - labeled
 
 permissions:
   contents: write
@@ -15,16 +17,18 @@ jobs:
 
     steps:
       # --------------------------------------------------
-      # 1. Debug trigger (prove workflow is triggered)
+      # 1. Debug: prove workflow triggered
       # --------------------------------------------------
       - name: Debug trigger
         run: |
+          echo "✅ Workflow triggered"
           echo "Action: ${{ github.event.action }}"
-          echo "Issue #: ${{ github.event.issue.number }}"
+          echo "Issue number: ${{ github.event.issue.number }}"
+          echo "Issue title: ${{ github.event.issue.title }}"
           echo "Labels: ${{ join(github.event.issue.labels.*.name, ', ') }}"
 
       # --------------------------------------------------
-      # 2. Gate: Run ONLY if label = autofix
+      # 2. Gate: run only if label = autofix
       # --------------------------------------------------
       - name: Check autofix label
         id: gate
@@ -36,41 +40,38 @@ jobs:
             echo "run=false" >> $GITHUB_OUTPUT
           fi
 
-      - name: Stop if not autofix
+      - name: Exit if not autofix
         if: steps.gate.outputs.run != 'true'
         run: |
-          echo "Not an autofix issue. Stopping."
+          echo "ℹ️ Not an autofix issue. Exiting."
           exit 0
 
       # --------------------------------------------------
-      # 3. Checkout repo
+      # 3. Checkout repository
       # --------------------------------------------------
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       # --------------------------------------------------
       # 4. Create feature branch
       # --------------------------------------------------
-      - name: Create branch
+      - name: Create feature branch
         run: |
           BRANCH="autofix/issue-${{ github.event.issue.number }}"
           echo "BRANCH=$BRANCH" >> $GITHUB_ENV
           git checkout -b "$BRANCH"
 
       # --------------------------------------------------
-      # 5. Call Azure OpenAI (NO AGENTS)
+      # 5. Call Azure OpenAI (no agents)
       # --------------------------------------------------
-      - name: Call Azure OpenAI to generate code
+      - name: Call Azure OpenAI
         env:
           AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
           AZURE_OPENAI_KEY: ${{ secrets.AZURE_OPENAI_KEY }}
           AZURE_OPENAI_DEPLOYMENT: ${{ secrets.AZURE_OPENAI_DEPLOYMENT }}
         run: |
           PROMPT=$(cat <<'EOF'
-You are a senior software engineer.
-
-RULES:
-- Respond ONLY with valid JSON
-- No markdown, no explanations, no backticks
+Return ONLY valid JSON. No markdown. No explanations. No backticks.
 
 JSON FORMAT:
 {
@@ -80,11 +81,8 @@ JSON FORMAT:
       "content": "full file content"
     }
   ],
-  "summary": "short explanation"
+  "summary": "short summary"
 }
-
-TASK:
-Analyze the following GitHub issue and generate the required code.
 
 ISSUE TITLE:
 ${{ github.event.issue.title }}
@@ -97,7 +95,9 @@ EOF
           PAYLOAD=$(jq -n \
             --arg prompt "$PROMPT" \
             '{
-              messages: [{ "role": "user", "content": $prompt }],
+              messages: [
+                { "role": "user", "content": $prompt }
+              ],
               temperature: 0.2
             }')
 
@@ -108,52 +108,53 @@ EOF
             | jq -r '.choices[0].message.content' > raw.json
 
       # --------------------------------------------------
-      # 6. Sanitize AI response
+      # 6. Sanitize AI output
       # --------------------------------------------------
-      - name: Sanitize response
+      - name: Sanitize AI response
         run: |
           sed 's/^```json//g; s/^```//g; s/```$//g' raw.json > result.json
+          echo "AI Response:"
           cat result.json
 
       # --------------------------------------------------
-      # 7. Validate & write files
+      # 7. Validate and write files
       # --------------------------------------------------
-      - name: Write generated code
+      - name: Write generated files
         run: |
           set -e
 
           jq -e '.files' result.json >/dev/null
 
-          COUNT=$(jq '.files | length' result.json)
-          if [ "$COUNT" -eq 0 ]; then
-            echo "No files generated"
+          FILE_COUNT=$(jq '.files | length' result.json)
+          if [ "$FILE_COUNT" -eq 0 ]; then
+            echo "ℹ️ No files generated. Exiting."
             exit 0
           fi
 
           jq -c '.files[]' result.json | while read file; do
-            path=$(echo "$file" | jq -r '.path')
-            content=$(echo "$file" | jq -r '.content')
-            mkdir -p "$(dirname "$path")"
-            echo "$content" > "$path"
+            FILE_PATH=$(echo "$file" | jq -r '.path')
+            FILE_CONTENT=$(echo "$file" | jq -r '.content')
+
+            mkdir -p "$(dirname "$FILE_PATH")"
+            echo "$FILE_CONTENT" > "$FILE_PATH"
+            echo "✅ Created $FILE_PATH"
           done
 
       # --------------------------------------------------
-      # 8. Commit changes
+      # 8. Commit and push changes
       # --------------------------------------------------
-      - name: Commit code
+      - name: Commit changes
         run: |
           git config user.name "autofix-bot"
           git config user.email "autofix@github.com"
           git add .
           git commit -m "autofix: issue #${{ github.event.issue.number }}"
-
-      - name: Push branch
-        run: git push origin "$BRANCH"
+          git push origin "$BRANCH"
 
       # --------------------------------------------------
       # 9. Create Pull Request
       # --------------------------------------------------
-      - name: Create PR
+      - name: Create Pull Request
         uses: actions/github-script@v7
         with:
           script: |
@@ -162,14 +163,14 @@ EOF
               repo: context.repo.repo,
               head: process.env.BRANCH,
               base: "main",
-              title: `Autofix: #${context.issue.number}`,
+              title: `Autofix: Issue #${context.issue.number}`,
               body: `✅ Auto-generated code\n\nCloses #${context.issue.number}`
             });
 
       # --------------------------------------------------
-      # 10. Close issue
+      # 10. Close the issue
       # --------------------------------------------------
-      - name: Close Issue
+      - name: Close issue
         uses: actions/github-script@v7
         with:
           script: |
@@ -178,4 +179,4 @@ EOF
               repo: context.repo.repo,
               issue_number: context.issue.number,
               state: "closed"
-            })
+            });
