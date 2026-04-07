@@ -15,6 +15,8 @@ jobs:
   autofix:
     runs-on: ubuntu-latest
 
+    # Trigger when issue is opened WITH autofix
+    # OR autofix label is added later
     if: >
       (
         github.event.action == 'opened' &&
@@ -25,69 +27,126 @@ jobs:
       )
 
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set variables
-        id: vars
+      # -------------------------------
+      # Set variables from issue
+      # -------------------------------
+      - name: Extract issue details
         run: |
           echo "BRANCH=autofix/issue-${{ github.event.issue.number }}" >> $GITHUB_ENV
+
           echo "ISSUE_TITLE<<EOF" >> $GITHUB_ENV
           echo "${{ github.event.issue.title }}" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
+
           echo "ISSUE_BODY<<EOF" >> $GITHUB_ENV
           echo "${{ github.event.issue.body }}" >> $GITHUB_ENV
           echo "EOF" >> $GITHUB_ENV
 
-      - name: Call Azure OpenAI (GPT-4o)
-        id: ai
+      # -------------------------------
+      # Call Azure OpenAI (STRICT JSON)
+      # -------------------------------
+      - name: Generate code using Azure OpenAI
         env:
-          ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
-          KEY: ${{ secrets.AZURE_OPENAI_KEY }}
-          DEPLOYMENT: ${{ secrets.AZURE_OPENAI_DEPLOYMENT }}
+          AZURE_OPENAI_ENDPOINT: ${{ secrets.AZURE_OPENAI_ENDPOINT }}
+          AZURE_OPENAI_KEY: ${{ secrets.AZURE_OPENAI_KEY }}
+          AZURE_OPENAI_DEPLOYMENT: ${{ secrets.AZURE_OPENAI_DEPLOYMENT }}
         run: |
-          PROMPT=$(cat <<'JSON'
-          You are a senior software engineer.
+          PROMPT=$(cat <<'EOF'
+You are an automation system.
 
-          Analyze the GitHub issue and return ONLY valid JSON:
-          {
-            "files": [
-              {
-                "path": "path/to/file",
-                "content": "file content"
-              }
-            ],
-            "summary": "short summary"
-          }
-          ISSUE:
-          JSON
-          )
+RULES:
+- Respond with ONLY valid JSON
+- Do NOT include explanations, markdown, or backticks
+- If no code is required, return files as an empty array
+
+JSON FORMAT (MANDATORY):
+{
+  "files": [
+    {
+      "path": "relative/path/to/file",
+      "content": "full file content"
+    }
+  ],
+  "summary": "short summary"
+}
+
+ISSUE TITLE:
+{{ISSUE_TITLE}}
+
+ISSUE BODY:
+{{ISSUE_BODY}}
+EOF
+)
 
           PAYLOAD=$(jq -n \
-            --arg prompt "$PROMPT\nTitle: $ISSUE_TITLE\nBody: $ISSUE_BODY" \
+            --arg prompt "$PROMPT" \
             '{
-              messages: [{ role: "user", content: $prompt }],
+              messages: [
+                { "role": "user", "content": $prompt }
+              ],
               temperature: 0.2
             }')
 
-          curl -s "$ENDPOINT/openai/deployments/$DEPLOYMENT/chat/completions?api-version=2024-02-01" \
+          curl -s "$AZURE_OPENAI_ENDPOINT/openai/deployments/$AZURE_OPENAI_DEPLOYMENT/chat/completions?api-version=2024-02-01" \
             -H "Content-Type: application/json" \
-            -H "api-key: $KEY" \
+            -H "api-key: $AZURE_OPENAI_KEY" \
             -d "$PAYLOAD" \
-            | jq -r '.choices[0].message.content' > result.json
+            | jq -r '.choices[0].message.content' > raw_result.json
 
-      - name: Validate & write files
+      # -------------------------------
+      # Sanitize GPT output
+      # -------------------------------
+      - name: Sanitize OpenAI response
         run: |
-          jq '.files[]' result.json > /dev/null
+          sed 's/^```json//g; s/^```//g; s/```$//g' raw_result.json > result.json
+
+      # -------------------------------
+      # Debug output (very important)
+      # -------------------------------
+      - name: Debug OpenAI output
+        run: |
+          echo "====== AI RESPONSE ======"
+          cat result.json
+          echo
+          echo "========================="
+
+      # -------------------------------
+      # Validate & write files SAFELY
+      # -------------------------------
+      - name: Validate and write generated files
+        run: |
+          set -e
+
+          # Ensure valid JSON with .files
+          if ! jq -e '.files' result.json >/dev/null; then
+            echo "❌ Invalid OpenAI JSON response"
+            exit 1
+          fi
+
+          FILE_COUNT=$(jq '.files | length' result.json)
+
+          if [ "$FILE_COUNT" -eq 0 ]; then
+            echo "ℹ️ No files generated. Stopping safely."
+            exit 0
+          fi
 
           jq -c '.files[]' result.json | while read file; do
             path=$(echo "$file" | jq -r '.path')
             content=$(echo "$file" | jq -r '.content')
+
             mkdir -p "$(dirname "$path")"
             echo "$content" > "$path"
+
+            echo "✅ Created $path"
           done
 
-      - name: Create branch and commit
+      # -------------------------------
+      # Create branch & commit
+      # -------------------------------
+      - name: Commit generated code
         run: |
           git checkout -b "$BRANCH"
           git config user.name "autofix-bot"
@@ -96,24 +155,27 @@ jobs:
           git commit -m "autofix: issue #${{ github.event.issue.number }}"
 
       - name: Push branch
-        run: |
-          git push origin "$BRANCH"
+        run: git push origin "$BRANCH"
 
+      # -------------------------------
+      # Create Pull Request
+      # -------------------------------
       - name: Create Pull Request
         uses: actions/github-script@v7
-        id: pr
         with:
           script: |
-            const pr = await github.rest.pulls.create({
+            await github.rest.pulls.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
               head: process.env.BRANCH,
               base: "main",
-              title: `Autofix: #${{ github.event.issue.number }} ${{ github.event.issue.title }}`,
-              body: `✅ Auto-generated code\n\nCloses #${{ github.event.issue.number }}`
+              title: `Autofix: #${context.issue.number} ${context.payload.issue.title}`,
+              body: `✅ AI-generated fix\n\nCloses #${context.issue.number}`
             });
-            core.setOutput("url", pr.data.html_url);
 
+      # -------------------------------
+      # Close original issue
+      # -------------------------------
       - name: Close Issue
         uses: actions/github-script@v7
         with:
