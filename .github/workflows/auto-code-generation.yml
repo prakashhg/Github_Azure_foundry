@@ -21,8 +21,8 @@ jobs:
     steps:
       # ------------------------------------------------------------
       # 0) Guard + Debug (ALWAYS RUNS)
-      #    This prevents the job itself from being "skipped".
-      #    All other steps are gated by guard output.
+      #    - Prevents whole job from being "skipped"
+      #    - All other steps run only if guard says run=true
       # ------------------------------------------------------------
       - name: Guard (run only if label is autofix)
         id: guard
@@ -81,7 +81,7 @@ jobs:
           echo "decision:    ${{ steps.guard.outputs.run }}"
           echo "reason:      ${{ steps.guard.outputs.reason }}"
 
-      # Optional: comment on issue if label missing (helps users)
+      # Optional (helpful): comment on issue when label missing
       - name: Comment when not eligible (missing label)
         if: steps.guard.outputs.run != 'true'
         env:
@@ -89,7 +89,7 @@ jobs:
         shell: bash
         run: |
           gh issue comment ${{ github.event.issue.number }} \
-            --body "⚠️ Auto-fix did not start because this issue does not have the required label. Add label **autofix** to trigger automation."
+            --body "⚠️ Auto-fix did not start because this issue does not have the required label. Add label **autofix** (or auto-fix / auto fix) to trigger automation."
 
       # ------------------------------------------------------------
       # Everything below runs ONLY when guard says run=true
@@ -118,8 +118,8 @@ jobs:
 
       # ------------------------------------------------------------
       # Call Azure OpenAI (retry + capture HTTP)
-      # FIXED: No more KeyError: PAYLOAD (Python gets payload path as argument)
-      # Writes files into RUNNER_TEMP so they are NOT committed.
+      # FIXED: No KeyError PAYLOAD (Python receives payload path as argument)
+      # All artifacts are in RUNNER_TEMP (not committed)
       # ------------------------------------------------------------
       - name: Call Azure OpenAI (retry + capture HTTP)
         if: steps.guard.outputs.run == 'true'
@@ -149,7 +149,7 @@ jobs:
               },
               {
                 "role": "user",
-                "content": "Generate production-ready code for the GitHub issue below.\n\nReturn ONLY JSON with this schema:\n{\n  \"files\": [\n    {\"path\": \"relative/path/to/file.ext\", \"content\": \"file content\"}\n  ],\n  \"summary\": \"short summary\",\n  \"notes\": \"important notes\"\n}\n\nRules:\n- files must be NON-EMPTY array\n- paths must be relative (no leading /)\n- no .. in paths\n- do not modify .github/workflows/*\n- output JSON only\n\nISSUE TITLE:\n__TITLE__\n\nISSUE BODY:\n__BODY__\n"
+                "content": "Generate production-ready code for the GitHub issue below.\n\nReturn ONLY JSON with this schema:\n{\n  \"files\": [\n    {\"path\": \"relative/path/to/file.ext\", \"content\": \"file content\"}\n  ],\n  \"summary\": \"short summary\",\n  \"notes\": \"important notes\"\n}\n\nRules:\n- Output JSON only (no markdown)\n- files must be NON-EMPTY array\n- Paths must be relative (no leading /) and must not contain '..'\n- Repo has NO Dockerfile unless explicitly requested. Do NOT create Dockerfile.\n- You MAY modify existing CI workflows under .github/workflows/ BUT you MUST NOT modify .github/workflows/auto-code-generation.yml\n- Do NOT create NEW workflow files; only update existing ones if needed\n\nISSUE TITLE:\n__TITLE__\n\nISSUE BODY:\n__BODY__\n"
               }
             ]
           }
@@ -239,7 +239,12 @@ jobs:
           PY
 
       # ------------------------------------------------------------
-      # Write generated files safely (block workflow edits + traversal)
+      # Write generated files safely:
+      # - blocks traversal & absolute paths
+      # - blocks .git/*
+      # - blocks changes to THIS workflow file
+      # - allows editing existing .github/workflows/* (like ci.yml)
+      # - blocks creating NEW workflow files
       # ------------------------------------------------------------
       - name: Write generated files safely
         if: steps.guard.outputs.run == 'true'
@@ -248,11 +253,17 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           import json, os, sys
+
           result_path = os.environ["RESULT"]
           with open(result_path, "r", encoding="utf-8") as f:
             result = json.load(f)
 
-          blocked_prefixes = [".github/workflows/", ".git/"]
+          blocked_exact = {
+            ".github/workflows/auto-code-generation.yml",
+            ".github/workflows/auto-code-generation.yaml"
+          }
+
+          blocked_prefixes = [".git/"]
 
           for item in result["files"]:
             path = item.get("path","")
@@ -262,14 +273,31 @@ jobs:
               print("❌ Invalid file path")
               sys.exit(1)
 
-            if path.startswith(("/", "\\")) or ".." in path.split("/"):
-              print(f"❌ Unsafe path blocked: {path}")
+            # Absolute path blocked
+            if path.startswith(("/", "\\")):
+              print(f"❌ Absolute path blocked: {path}")
               sys.exit(1)
 
+            # Path traversal blocked
+            if ".." in path.split("/"):
+              print(f"❌ Path traversal blocked: {path}")
+              sys.exit(1)
+
+            # Block exact forbidden files
+            if path in blocked_exact:
+              print(f"❌ Protected file blocked: {path}")
+              sys.exit(1)
+
+            # Block forbidden prefixes
             for bp in blocked_prefixes:
               if path.startswith(bp):
                 print(f"❌ Protected path blocked: {path}")
                 sys.exit(1)
+
+            # If it's a workflow file, allow only if it already exists (no new workflow creation)
+            if path.startswith(".github/workflows/") and not os.path.exists(path):
+              print(f"❌ Creating new workflow files is blocked: {path}")
+              sys.exit(1)
 
             os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
             with open(path, "w", encoding="utf-8") as wf:
@@ -279,8 +307,56 @@ jobs:
           PY
 
       # ------------------------------------------------------------
-      # Branch + commit + push (handles existing branch)
-      # Fixes non-fast-forward using --force-with-lease
+      # Optional but recommended:
+      # Install deps to generate correct lockfile when issue asks to install packages
+      # ------------------------------------------------------------
+      - name: Detect package manager
+        if: steps.guard.outputs.run == 'true'
+        id: pm
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f "pnpm-lock.yaml" ]; then
+            echo "manager=pnpm" >> "$GITHUB_OUTPUT"
+          elif [ -f "yarn.lock" ]; then
+            echo "manager=yarn" >> "$GITHUB_OUTPUT"
+          else
+            echo "manager=npm" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Detected package manager: $(cat $GITHUB_OUTPUT | tail -n 1)"
+
+      - name: Setup Node (use .nvmrc if present)
+        if: steps.guard.outputs.run == 'true' && hashFiles('.nvmrc') != ''
+        uses: actions/setup-node@v4
+        with:
+          node-version-file: .nvmrc
+
+      - name: Setup Node (fallback to 22)
+        if: steps.guard.outputs.run == 'true' && hashFiles('.nvmrc') == ''
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install dependencies (update lockfile when needed)
+        if: steps.guard.outputs.run == 'true' && hashFiles('package.json') != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${{ steps.pm.outputs.manager }}" = "pnpm" ]; then
+            corepack enable
+            pnpm install --frozen-lockfile=false
+          elif [ "${{ steps.pm.outputs.manager }}" = "yarn" ]; then
+            corepack enable
+            # Updates lockfile if dependencies changed
+            yarn install --mode update-lockfile
+          else
+            npm install
+          fi
+
+      # ------------------------------------------------------------
+      # Branch + commit + push
+      # - handles existing remote branch via --force-with-lease
       # ------------------------------------------------------------
       - name: Create branch and commit changes
         if: steps.guard.outputs.run == 'true'
@@ -305,7 +381,7 @@ jobs:
           git push --force-with-lease origin "$BRANCH"
 
       # ------------------------------------------------------------
-      # Create PR (or reuse existing), then close issue
+      # PR create/reuse + close issue
       # ------------------------------------------------------------
       - name: Create PR (or reuse existing) and close issue
         if: steps.guard.outputs.run == 'true'
