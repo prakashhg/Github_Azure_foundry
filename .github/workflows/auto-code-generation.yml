@@ -1,11 +1,11 @@
-name: Auto Code Generation with Azure OpenAI (OIDC)
+name: Auto Code Generation with Azure OpenAI (OIDC + API Key)
 
 on:
   issues:
-    types: [labeled]  # ✅ single run; no "opened" event
+    types: [labeled]   # ✅ single run
 
 permissions:
-  id-token: write          # ✅ required for OIDC token minting [1](https://christosgalano.github.io/github-actions-permissions/)
+  id-token: write      # ✅ required for GitHub OIDC token minting [2](https://bing.com/search?q=GitHub+Actions+is+not+permitted+to+create+or+approve+pull+requests+createPullRequest+allow+GitHub+Actions+to+create+and+approve+pull+requests)
   contents: write
   pull-requests: write
   issues: write
@@ -16,10 +16,10 @@ concurrency:
 
 jobs:
   auto-fix:
-    name: Issue → Azure OpenAI (OIDC) → Branch/Commit → PR → Close Issue
+    name: Issue → Azure OpenAI → Branch/Commit → PR → Close Issue
     runs-on: ubuntu-latest
 
-    # ✅ Only run when the label that was added is autofix (or variants)
+    # ✅ Run only when the added label is autofix (or variants)
     if: >
       github.event.label.name == 'autofix' ||
       github.event.label.name == 'auto-fix' ||
@@ -29,7 +29,7 @@ jobs:
 
     steps:
       # ------------------------------------------------------------
-      # 0) Quick debug header
+      # 0) Debug trigger
       # ------------------------------------------------------------
       - name: Debug trigger
         shell: bash
@@ -40,7 +40,7 @@ jobs:
           echo "actor:       ${{ github.actor }}"
 
       # ------------------------------------------------------------
-      # 1) Checkout repository
+      # 1) Checkout
       # ------------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -48,22 +48,28 @@ jobs:
           fetch-depth: 0
 
       # ------------------------------------------------------------
-      # 2) Validate required secrets exist (safe; doesn't print values)
+      # 2) Validate required secrets exist (safe)
       # ------------------------------------------------------------
       - name: Validate required secrets exist (safe)
         shell: bash
         run: |
           set -euo pipefail
+
+          # OIDC for Azure login (Terraform naming)
           [ -n "${{ secrets.ARM_CLIENT_ID }}" ] || (echo "❌ Missing secret: ARM_CLIENT_ID" && exit 1)
           [ -n "${{ secrets.ARM_TENANT_ID }}" ] || (echo "❌ Missing secret: ARM_TENANT_ID" && exit 1)
           [ -n "${{ secrets.ARM_SUBSCRIPTION_ID }}" ] || (echo "❌ Missing secret: ARM_SUBSCRIPTION_ID" && exit 1)
+
+          # Azure OpenAI API-key path (required until custom subdomain is enabled)
           [ -n "${{ secrets.AZURE_OPENAI_ENDPOINT }}" ] || (echo "❌ Missing secret: AZURE_OPENAI_ENDPOINT" && exit 1)
           [ -n "${{ secrets.AZURE_OPENAI_DEPLOYMENT }}" ] || (echo "❌ Missing secret: AZURE_OPENAI_DEPLOYMENT" && exit 1)
-          echo "✅ Required secrets present"
+          [ -n "${{ secrets.AZURE_OPENAI_KEY }}" ] || (echo "❌ Missing secret: AZURE_OPENAI_KEY" && exit 1)
+
+          echo "✅ All required secrets are present"
 
       # ------------------------------------------------------------
       # 3) Azure Login using OIDC (Workload Identity Federation)
-      #    - No client secret needed
+      #    Uses ARM_* secrets
       # ------------------------------------------------------------
       - name: Azure Login (OIDC)
         uses: azure/login@v2
@@ -71,7 +77,7 @@ jobs:
           client-id:       ${{ secrets.ARM_CLIENT_ID }}
           tenant-id:       ${{ secrets.ARM_TENANT_ID }}
           subscription-id: ${{ secrets.ARM_SUBSCRIPTION_ID }}
-        # OIDC login pattern per Microsoft Learn and GitHub OIDC docs [2](https://github.com/github/docs/blob/main/content/repositories/managing-your-repositorys-settings-and-features/enabling-features-for-your-repository/managing-github-actions-settings-for-a-repository.md)[1](https://christosgalano.github.io/github-actions-permissions/)
+        # azure/login + id-token:write is the standard GitHub→Azure OIDC pattern [1](https://journeyofthegeek.com/2023/04/06/authorization-in-azure-openai-service/)[2](https://bing.com/search?q=GitHub+Actions+is+not+permitted+to+create+or+approve+pull+requests+createPullRequest+allow+GitHub+Actions+to+create+and+approve+pull+requests)
 
       # ------------------------------------------------------------
       # 4) Extract issue details
@@ -80,7 +86,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           echo "ISSUE_NUMBER=${{ github.event.issue.number }}" >> $GITHUB_ENV
 
           echo "ISSUE_TITLE<<EOF" >> $GITHUB_ENV
@@ -92,25 +97,22 @@ jobs:
           echo "EOF" >> $GITHUB_ENV
 
       # ------------------------------------------------------------
-      # 5) Call Azure OpenAI using Entra ID Bearer token (OIDC → token)
-      #    - No AZURE_OPENAI_KEY used
+      # 5) Call Azure OpenAI using API KEY
+      #    Reason: token auth requires custom subdomain; otherwise API key is required [3](https://www.youtube.com/watch?v=nupZDYF5lMA)[4](https://www.youtube.com/watch?v=Chr0IeYQdk0)
       # ------------------------------------------------------------
-      - name: Call Azure OpenAI (OIDC bearer token)
+      - name: Call Azure OpenAI (API key)
         env:
           AZURE_OPENAI_ENDPOINT:   ${{ secrets.AZURE_OPENAI_ENDPOINT }}
           AZURE_OPENAI_DEPLOYMENT: ${{ secrets.AZURE_OPENAI_DEPLOYMENT }}
+          AZURE_OPENAI_KEY:        ${{ secrets.AZURE_OPENAI_KEY }}
         shell: bash
         run: |
           set -euo pipefail
+          echo "::add-mask::$AZURE_OPENAI_KEY"
 
           ENDPOINT="${AZURE_OPENAI_ENDPOINT%/}"
           DEPLOYMENT="$AZURE_OPENAI_DEPLOYMENT"
           URL="$ENDPOINT/openai/deployments/$DEPLOYMENT/chat/completions?api-version=2024-02-15-preview"
-
-          # Acquire token for Azure Cognitive Services scope (RBAC auth) [3](https://github.com/peter-evans/create-pull-request)[4](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/enabling-features-for-your-repository/managing-github-actions-settings-for-a-repository)
-          TOKEN="$(az account get-access-token \
-            --resource https://cognitiveservices.azure.com/ \
-            --query accessToken -o tsv)"
 
           PAYLOAD="$RUNNER_TEMP/payload.json"
           AI_RESP="$RUNNER_TEMP/ai-response.json"
@@ -126,7 +128,7 @@ jobs:
               },
               {
                 "role": "user",
-                "content": "Generate production-ready code for the GitHub issue below.\n\nReturn ONLY JSON with this schema:\n{\n  \"files\": [\n    {\"path\": \"relative/path/to/file.ext\", \"content\": \"file content\"}\n  ],\n  \"summary\": \"short summary\",\n  \"notes\": \"important notes\"\n}\n\nRules:\n- Output JSON only\n- files must be NON-EMPTY array\n- Paths must be relative and must not contain '..'\n- Do NOT modify .github/workflows/auto-code-generation.yml\n- You MAY update existing workflow files under .github/workflows/ (like ci.yml) but MUST NOT create new workflow files\n\nISSUE TITLE:\n__TITLE__\n\nISSUE BODY:\n__BODY__\n"
+                "content": "Generate production-ready code for the GitHub issue below.\n\nReturn ONLY JSON with this schema:\n{\n  \"files\": [\n    {\"path\": \"relative/path/to/file.ext\", \"content\": \"file content\"}\n  ],\n  \"summary\": \"short summary\",\n  \"notes\": \"important notes\"\n}\n\nRules:\n- Output JSON only\n- files must be NON-EMPTY array\n- Paths must be relative and must not contain '..'\n- Do NOT modify .github/workflows/auto-code-generation.yml\n- Only update existing workflow files under .github/workflows/ if needed (do NOT create new ones)\n\nISSUE TITLE:\n__TITLE__\n\nISSUE BODY:\n__BODY__\n"
               }
             ]
           }
@@ -147,7 +149,7 @@ jobs:
           HTTP_CODE="$(curl -sS -o "$AI_RESP" -w "%{http_code}" \
             "$URL" \
             -H "Content-Type: application/json" \
-            -H "Authorization: Bearer $TOKEN" \
+            -H "api-key: $AZURE_OPENAI_KEY" \
             --data-binary @"$PAYLOAD" || true)"
 
           echo "HTTP_CODE=$HTTP_CODE" >> $GITHUB_ENV
@@ -155,13 +157,12 @@ jobs:
           echo "RESULT=$RESULT" >> $GITHUB_ENV
 
       # ------------------------------------------------------------
-      # 6) Validate Azure response (fail-fast => RED)
+      # 6) Validate Azure response (fail-fast)
       # ------------------------------------------------------------
       - name: Validate Azure OpenAI response (fail fast)
         shell: bash
         run: |
           set -euo pipefail
-
           if [ "${HTTP_CODE}" -ne 200 ]; then
             echo "❌ Azure OpenAI call failed with HTTP ${HTTP_CODE}"
             head -c 2000 "$AI_RESP" || true
@@ -176,12 +177,7 @@ jobs:
           with open(ai_resp, "r", encoding="utf-8") as f:
               raw = json.load(f)
 
-          try:
-              content = raw["choices"][0]["message"]["content"]
-          except Exception:
-              print("❌ Missing choices[0].message.content")
-              sys.exit(1)
-
+          content = raw["choices"][0]["message"]["content"]
           try:
               result = json.loads(content)
           except Exception as e:
@@ -202,9 +198,6 @@ jobs:
 
       # ------------------------------------------------------------
       # 7) Write generated files safely
-      #    - block absolute paths, traversal, .git/*
-      #    - block editing this workflow
-      #    - block creating new workflow files (allow editing existing)
       # ------------------------------------------------------------
       - name: Write generated files safely
         shell: bash
@@ -261,7 +254,7 @@ jobs:
           PY
 
       # ------------------------------------------------------------
-      # 8) Create branch, commit, push (safe even if branch exists)
+      # 8) Create branch, commit, push
       # ------------------------------------------------------------
       - name: Create branch and commit changes
         shell: bash
@@ -284,8 +277,7 @@ jobs:
           git push --force-with-lease origin "$BRANCH"
 
       # ------------------------------------------------------------
-      # 9) Create PR (or reuse), then close issue
-      #    Requires GitHub setting: Allow Actions to create PRs [5](https://microsoft.github.io/autogen/dev/user-guide/core-user-guide/cookbook/azure-openai-with-aad-auth.html)[6](https://learn.microsoft.com/en-us/azure/developer/github/connect-from-azure-openid-connect)[7](https://bing.com/search?q=Azure+OpenAI+authentication+Azure+Active+Directory+OAuth+bearer+token+api-key+difference)
+      # 9) Create PR + close issue
       # ------------------------------------------------------------
       - name: Create PR (or reuse existing) and close issue
         env:
@@ -301,7 +293,7 @@ jobs:
             set +e
             gh pr create \
               --title "Auto fix: $ISSUE_TITLE" \
-              --body "Auto-generated by Azure OpenAI (OIDC) for issue #$ISSUE_NUMBER." \
+              --body "Auto-generated by Azure OpenAI for issue #$ISSUE_NUMBER." \
               --base main \
               --head "$BRANCH"
             rc=$?
