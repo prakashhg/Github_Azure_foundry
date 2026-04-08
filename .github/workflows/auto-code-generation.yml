@@ -2,10 +2,10 @@ name: Auto Code Generation with Azure OpenAI (OIDC)
 
 on:
   issues:
-    types: [labeled]  # ✅ Only one run when label is added
+    types: [labeled]  # ✅ single run; no "opened" event
 
 permissions:
-  id-token: write          # ✅ Required for OIDC token in GitHub Actions [3](https://christosgalano.github.io/github-actions-permissions/)
+  id-token: write          # ✅ required for OIDC token minting [1](https://christosgalano.github.io/github-actions-permissions/)
   contents: write
   pull-requests: write
   issues: write
@@ -19,60 +19,68 @@ jobs:
     name: Issue → Azure OpenAI (OIDC) → Branch/Commit → PR → Close Issue
     runs-on: ubuntu-latest
 
+    # ✅ Only run when the label that was added is autofix (or variants)
+    if: >
+      github.event.label.name == 'autofix' ||
+      github.event.label.name == 'auto-fix' ||
+      github.event.label.name == 'auto fix' ||
+      github.event.label.name == 'AutoFix' ||
+      github.event.label.name == 'Auto-Fix'
+
     steps:
       # ------------------------------------------------------------
-      # 0) Guard: Only proceed when label is autofix (case-insensitive)
+      # 0) Quick debug header
       # ------------------------------------------------------------
-      - name: Guard (run only if label is autofix)
-        id: guard
+      - name: Debug trigger
         shell: bash
         run: |
-          set -euo pipefail
-          LABEL="${{ github.event.label.name }}"
-          LABEL_LOWER="$(echo "$LABEL" | tr '[:upper:]' '[:lower:]')"
-          echo "Action: ${{ github.event.action }}"
-          echo "Label:  $LABEL_LOWER"
-          echo "Issue:  #${{ github.event.issue.number }}"
-          echo "Actor:  ${{ github.actor }}"
-
-          if [[ "$LABEL_LOWER" != "autofix" && "$LABEL_LOWER" != "auto-fix" && "$LABEL_LOWER" != "auto fix" ]]; then
-            echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "Not an autofix label. Exiting successfully."
-            exit 0
-          fi
-
-          echo "run=true" >> "$GITHUB_OUTPUT"
-          echo "Autofix label detected. Proceeding..."
+          echo "action:      ${{ github.event.action }}"
+          echo "label added: ${{ github.event.label.name }}"
+          echo "issue:       #${{ github.event.issue.number }}"
+          echo "actor:       ${{ github.actor }}"
 
       # ------------------------------------------------------------
-      # 1) Checkout
+      # 1) Checkout repository
       # ------------------------------------------------------------
       - name: Checkout repository
-        if: steps.guard.outputs.run == 'true'
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       # ------------------------------------------------------------
-      # 2) Azure Login via OIDC (no client secret)
+      # 2) Validate required secrets exist (safe; doesn't print values)
+      # ------------------------------------------------------------
+      - name: Validate required secrets exist (safe)
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "${{ secrets.AZURE_CLIENT_ID }}" ] || (echo "❌ Missing secret: AZURE_CLIENT_ID" && exit 1)
+          [ -n "${{ secrets.AZURE_TENANT_ID }}" ] || (echo "❌ Missing secret: AZURE_TENANT_ID" && exit 1)
+          [ -n "${{ secrets.AZURE_SUBSCRIPTION_ID }}" ] || (echo "❌ Missing secret: AZURE_SUBSCRIPTION_ID" && exit 1)
+          [ -n "${{ secrets.AZURE_OPENAI_ENDPOINT }}" ] || (echo "❌ Missing secret: AZURE_OPENAI_ENDPOINT" && exit 1)
+          [ -n "${{ secrets.AZURE_OPENAI_DEPLOYMENT }}" ] || (echo "❌ Missing secret: AZURE_OPENAI_DEPLOYMENT" && exit 1)
+          echo "✅ Required secrets present"
+
+      # ------------------------------------------------------------
+      # 3) Azure Login using OIDC (Workload Identity Federation)
+      #    - No client secret needed
       # ------------------------------------------------------------
       - name: Azure Login (OIDC)
-        if: steps.guard.outputs.run == 'true'
         uses: azure/login@v2
         with:
           client-id:       ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id:       ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-        # This exchanges GitHub OIDC token for Azure access token via federation [2](https://github.com/github/docs/blob/main/content/repositories/managing-your-repositorys-settings-and-features/enabling-features-for-your-repository/managing-github-actions-settings-for-a-repository.md)[3](https://christosgalano.github.io/github-actions-permissions/)
+        # OIDC login pattern per Microsoft Learn and GitHub OIDC docs [2](https://github.com/github/docs/blob/main/content/repositories/managing-your-repositorys-settings-and-features/enabling-features-for-your-repository/managing-github-actions-settings-for-a-repository.md)[1](https://christosgalano.github.io/github-actions-permissions/)
 
       # ------------------------------------------------------------
-      # 3) Extract issue details
+      # 4) Extract issue details
       # ------------------------------------------------------------
       - name: Extract issue details
-        if: steps.guard.outputs.run == 'true'
         shell: bash
         run: |
           set -euo pipefail
+
           echo "ISSUE_NUMBER=${{ github.event.issue.number }}" >> $GITHUB_ENV
 
           echo "ISSUE_TITLE<<EOF" >> $GITHUB_ENV
@@ -84,10 +92,10 @@ jobs:
           echo "EOF" >> $GITHUB_ENV
 
       # ------------------------------------------------------------
-      # 4) Call Azure OpenAI using Entra ID token (Bearer)
+      # 5) Call Azure OpenAI using Entra ID Bearer token (OIDC → token)
+      #    - No AZURE_OPENAI_KEY used
       # ------------------------------------------------------------
       - name: Call Azure OpenAI (OIDC bearer token)
-        if: steps.guard.outputs.run == 'true'
         env:
           AZURE_OPENAI_ENDPOINT:   ${{ secrets.AZURE_OPENAI_ENDPOINT }}
           AZURE_OPENAI_DEPLOYMENT: ${{ secrets.AZURE_OPENAI_DEPLOYMENT }}
@@ -99,9 +107,10 @@ jobs:
           DEPLOYMENT="$AZURE_OPENAI_DEPLOYMENT"
           URL="$ENDPOINT/openai/deployments/$DEPLOYMENT/chat/completions?api-version=2024-02-15-preview"
 
-          # Acquire access token for Azure Cognitive Services scope (RBAC)
-          # This is how Entra ID auth is used for Azure OpenAI inference calls [4](https://github.com/peter-evans/create-pull-request)[5](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/enabling-features-for-your-repository/managing-github-actions-settings-for-a-repository)
-          TOKEN="$(az account get-access-token --resource https://cognitiveservices.azure.com/ --query accessToken -o tsv)"
+          # Acquire token for Azure Cognitive Services scope (RBAC auth) [3](https://github.com/peter-evans/create-pull-request)[4](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/enabling-features-for-your-repository/managing-github-actions-settings-for-a-repository)
+          TOKEN="$(az account get-access-token \
+            --resource https://cognitiveservices.azure.com/ \
+            --query accessToken -o tsv)"
 
           PAYLOAD="$RUNNER_TEMP/payload.json"
           AI_RESP="$RUNNER_TEMP/ai-response.json"
@@ -117,7 +126,7 @@ jobs:
               },
               {
                 "role": "user",
-                "content": "Generate production-ready code for the GitHub issue below.\n\nReturn ONLY JSON with this schema:\n{\n  \"files\": [\n    {\"path\": \"relative/path/to/file.ext\", \"content\": \"file content\"}\n  ],\n  \"summary\": \"short summary\",\n  \"notes\": \"important notes\"\n}\n\nRules:\n- Output JSON only (no markdown)\n- files must be NON-EMPTY array\n- Paths must be relative (no leading /) and must not contain '..'\n- Do NOT modify .github/workflows/auto-code-generation.yml\n- You MAY update existing workflows under .github/workflows/ (like ci.yml) but MUST NOT create new workflow files\n\nISSUE TITLE:\n__TITLE__\n\nISSUE BODY:\n__BODY__\n"
+                "content": "Generate production-ready code for the GitHub issue below.\n\nReturn ONLY JSON with this schema:\n{\n  \"files\": [\n    {\"path\": \"relative/path/to/file.ext\", \"content\": \"file content\"}\n  ],\n  \"summary\": \"short summary\",\n  \"notes\": \"important notes\"\n}\n\nRules:\n- Output JSON only\n- files must be NON-EMPTY array\n- Paths must be relative and must not contain '..'\n- Do NOT modify .github/workflows/auto-code-generation.yml\n- You MAY update existing workflow files under .github/workflows/ (like ci.yml) but MUST NOT create new workflow files\n\nISSUE TITLE:\n__TITLE__\n\nISSUE BODY:\n__BODY__\n"
               }
             ]
           }
@@ -127,15 +136,14 @@ jobs:
           import json, os, sys
           payload = sys.argv[1]
           with open(payload, "r", encoding="utf-8") as f:
-            data = json.load(f)
+              data = json.load(f)
           title = os.environ.get("ISSUE_TITLE","")
           body  = os.environ.get("ISSUE_BODY","")
           data["messages"][1]["content"] = data["messages"][1]["content"].replace("__TITLE__", title).replace("__BODY__", body)
           with open(payload, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
+              json.dump(data, f, ensure_ascii=False)
           PY
 
-          # Call AOAI with Bearer token (OIDC → Azure token exchange already done by azure/login)
           HTTP_CODE="$(curl -sS -o "$AI_RESP" -w "%{http_code}" \
             "$URL" \
             -H "Content-Type: application/json" \
@@ -147,10 +155,9 @@ jobs:
           echo "RESULT=$RESULT" >> $GITHUB_ENV
 
       # ------------------------------------------------------------
-      # 5) Validate Azure response (fail-fast = RED)
+      # 6) Validate Azure response (fail-fast => RED)
       # ------------------------------------------------------------
       - name: Validate Azure OpenAI response (fail fast)
-        if: steps.guard.outputs.run == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -167,42 +174,39 @@ jobs:
           result_path = os.environ["RESULT"]
 
           with open(ai_resp, "r", encoding="utf-8") as f:
-            raw = json.load(f)
+              raw = json.load(f)
 
           try:
-            content = raw["choices"][0]["message"]["content"]
+              content = raw["choices"][0]["message"]["content"]
           except Exception:
-            print("❌ Missing choices[0].message.content")
-            sys.exit(1)
+              print("❌ Missing choices[0].message.content")
+              sys.exit(1)
 
           try:
-            result = json.loads(content)
+              result = json.loads(content)
           except Exception as e:
-            print("❌ Model did not return valid JSON:", e)
-            print(content[:2000])
-            sys.exit(1)
+              print("❌ Model did not return valid JSON:", e)
+              print(content[:2000])
+              sys.exit(1)
 
           files = result.get("files")
           if not isinstance(files, list) or len(files) == 0:
-            print("❌ JSON missing non-empty files[]")
-            sys.exit(1)
+              print("❌ JSON missing non-empty files[]")
+              sys.exit(1)
 
           with open(result_path, "w", encoding="utf-8") as f:
-            json.dump(result, f, ensure_ascii=False, indent=2)
+              json.dump(result, f, ensure_ascii=False, indent=2)
 
           print("✅ Azure response valid JSON with non-empty files[]")
           PY
 
       # ------------------------------------------------------------
-      # 6) Write generated files safely
-      #    - blocks traversal/absolute paths
-      #    - blocks .git/*
-      #    - blocks changing this workflow
-      #    - allows editing existing workflow files
-      #    - blocks creating new workflow files
+      # 7) Write generated files safely
+      #    - block absolute paths, traversal, .git/*
+      #    - block editing this workflow
+      #    - block creating new workflow files (allow editing existing)
       # ------------------------------------------------------------
       - name: Write generated files safely
-        if: steps.guard.outputs.run == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -211,56 +215,55 @@ jobs:
 
           result_path = os.environ["RESULT"]
           with open(result_path, "r", encoding="utf-8") as f:
-            result = json.load(f)
+              result = json.load(f)
 
           blocked_exact = {
-            ".github/workflows/auto-code-generation.yml",
-            ".github/workflows/auto-code-generation.yaml"
+              ".github/workflows/auto-code-generation.yml",
+              ".github/workflows/auto-code-generation.yaml"
           }
           blocked_prefixes = [".git/"]
 
           for item in result["files"]:
-            path = item.get("path","")
-            content = item.get("content","")
+              path = item.get("path","")
+              content = item.get("content","")
 
-            if not isinstance(path, str) or not path.strip():
-              print("❌ Invalid file path")
-              sys.exit(1)
+              if not isinstance(path, str) or not path.strip():
+                  print("❌ Invalid file path")
+                  sys.exit(1)
 
-            if path.startswith(("/", "\\")):
-              print(f"❌ Absolute path blocked: {path}")
-              sys.exit(1)
+              if path.startswith(("/", "\\")):
+                  print(f"❌ Absolute path blocked: {path}")
+                  sys.exit(1)
 
-            if ".." in path.split("/"):
-              print(f"❌ Path traversal blocked: {path}")
-              sys.exit(1)
+              if ".." in path.split("/"):
+                  print(f"❌ Path traversal blocked: {path}")
+                  sys.exit(1)
 
-            if path in blocked_exact:
-              print(f"❌ Protected file blocked: {path}")
-              sys.exit(1)
+              if path in blocked_exact:
+                  print(f"❌ Protected file blocked: {path}")
+                  sys.exit(1)
 
-            for bp in blocked_prefixes:
-              if path.startswith(bp):
-                print(f"❌ Protected path blocked: {path}")
-                sys.exit(1)
+              for bp in blocked_prefixes:
+                  if path.startswith(bp):
+                      print(f"❌ Protected path blocked: {path}")
+                      sys.exit(1)
 
-            # If it is a workflow file, allow only if it already exists
-            if path.startswith(".github/workflows/") and not os.path.exists(path):
-              print(f"❌ Creating new workflow files is blocked: {path}")
-              sys.exit(1)
+              # allow editing existing workflows but block creating new ones
+              if path.startswith(".github/workflows/") and not os.path.exists(path):
+                  print(f"❌ Creating new workflow files is blocked: {path}")
+                  sys.exit(1)
 
-            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-            with open(path, "w", encoding="utf-8") as wf:
-              wf.write(content)
+              os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+              with open(path, "w", encoding="utf-8") as wf:
+                  wf.write(content)
 
-            print(f"Wrote: {path}")
+              print(f"Wrote: {path}")
           PY
 
       # ------------------------------------------------------------
-      # 7) Branch + commit + push (safe even if branch exists remotely)
+      # 8) Create branch, commit, push (safe even if branch exists)
       # ------------------------------------------------------------
       - name: Create branch and commit changes
-        if: steps.guard.outputs.run == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -281,10 +284,10 @@ jobs:
           git push --force-with-lease origin "$BRANCH"
 
       # ------------------------------------------------------------
-      # 8) PR create/reuse + close issue
+      # 9) Create PR (or reuse), then close issue
+      #    Requires GitHub setting: Allow Actions to create PRs [5](https://microsoft.github.io/autogen/dev/user-guide/core-user-guide/cookbook/azure-openai-with-aad-auth.html)[6](https://learn.microsoft.com/en-us/azure/developer/github/connect-from-azure-openid-connect)[7](https://bing.com/search?q=Azure+OpenAI+authentication+Azure+Active+Directory+OAuth+bearer+token+api-key+difference)
       # ------------------------------------------------------------
       - name: Create PR (or reuse existing) and close issue
-        if: steps.guard.outputs.run == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
@@ -295,11 +298,20 @@ jobs:
           if gh pr view --head "$BRANCH" >/dev/null 2>&1; then
             echo "✅ PR already exists for $BRANCH. Skipping PR creation."
           else
+            set +e
             gh pr create \
               --title "Auto fix: $ISSUE_TITLE" \
               --body "Auto-generated by Azure OpenAI (OIDC) for issue #$ISSUE_NUMBER." \
               --base main \
               --head "$BRANCH"
+            rc=$?
+            set -e
+
+            if [ "$rc" -ne 0 ]; then
+              echo "❌ PR creation failed."
+              echo "Fix: Repo Settings → Actions → General → enable 'Allow GitHub Actions to create and approve pull requests'."
+              exit 1
+            fi
           fi
 
           gh issue close "$ISSUE_NUMBER" --comment "✅ Issue fixed and PR created/updated automatically."
