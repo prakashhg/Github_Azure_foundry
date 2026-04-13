@@ -29,17 +29,6 @@ jobs:
 
     steps:
       # ------------------------------------------------------------
-      # 0) Debug trigger
-      # ------------------------------------------------------------
-      - name: Debug trigger
-        shell: bash
-        run: |
-          echo "action:      ${{ github.event.action }}"
-          echo "label added: ${{ github.event.label.name }}"
-          echo "issue:       #${{ github.event.issue.number }}"
-          echo "actor:       ${{ github.actor }}"
-
-      # ------------------------------------------------------------
       # 1) Checkout
       # ------------------------------------------------------------
       - name: Checkout repository
@@ -48,24 +37,12 @@ jobs:
           fetch-depth: 0
 
       # ------------------------------------------------------------
-      # 2) Validate required secrets exist (safe)
+      # 2) Setup Python
       # ------------------------------------------------------------
-      - name: Validate required secrets exist (safe)
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          # OIDC for Azure login (Terraform naming)
-          [ -n "${{ secrets.ARM_CLIENT_ID }}" ] || (echo "❌ Missing secret: ARM_CLIENT_ID" && exit 1)
-          [ -n "${{ secrets.ARM_TENANT_ID }}" ] || (echo "❌ Missing secret: ARM_TENANT_ID" && exit 1)
-          [ -n "${{ secrets.ARM_SUBSCRIPTION_ID }}" ] || (echo "❌ Missing secret: ARM_SUBSCRIPTION_ID" && exit 1)
-
-          # Azure OpenAI API-key path (required until custom subdomain is enabled)
-          [ -n "${{ secrets.AZURE_OPENAI_ENDPOINT }}" ] || (echo "❌ Missing secret: AZURE_OPENAI_ENDPOINT" && exit 1)
-          [ -n "${{ secrets.AZURE_OPENAI_DEPLOYMENT }}" ] || (echo "❌ Missing secret: AZURE_OPENAI_DEPLOYMENT" && exit 1)
-          [ -n "${{ secrets.AZURE_OPENAI_KEY }}" ] || (echo "❌ Missing secret: AZURE_OPENAI_KEY" && exit 1)
-
-          echo "✅ All required secrets are present"
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
 
       # ------------------------------------------------------------
       # 3) Azure Login using OIDC (Workload Identity Federation)
@@ -97,10 +74,9 @@ jobs:
           echo "EOF" >> $GITHUB_ENV
 
       # ------------------------------------------------------------
-      # 5) Call Azure OpenAI using API KEY
-      #    Reason: token auth requires custom subdomain; otherwise API key is required [3](https://www.youtube.com/watch?v=nupZDYF5lMA)[4](https://www.youtube.com/watch?v=Chr0IeYQdk0)
+      # 5) Call Azure AI Foundry using API KEY
       # ------------------------------------------------------------
-      - name: Call Azure OpenAI (API key)
+      - name: Call Azure AI Foundry (API key)
         env:
           AZURE_OPENAI_ENDPOINT:   ${{ secrets.AZURE_OPENAI_ENDPOINT }}
           AZURE_OPENAI_DEPLOYMENT: ${{ secrets.AZURE_OPENAI_DEPLOYMENT }}
@@ -112,15 +88,22 @@ jobs:
 
           ENDPOINT="${AZURE_OPENAI_ENDPOINT%/}"
           DEPLOYMENT="$AZURE_OPENAI_DEPLOYMENT"
-          URL="$ENDPOINT/openai/deployments/$DEPLOYMENT/chat/completions?api-version=2024-02-15-preview"
+
+          # ✅ Azure AI Foundry model inference endpoint
+          # POST https://{resource}.services.ai.azure.com/models/chat/completions?api-version=2024-05-01-preview
+          URL="$ENDPOINT/models/chat/completions?api-version=2024-05-01-preview"
 
           PAYLOAD="$RUNNER_TEMP/payload.json"
           AI_RESP="$RUNNER_TEMP/ai-response.json"
           RESULT="$RUNNER_TEMP/result.json"
 
-          cat > "$PAYLOAD" <<'JSON'
+          # Build the request payload.
+          # NOTE: 'model' should be your Foundry deployment name.
+          cat > "$PAYLOAD" <<JSON
           {
+            "model": "$DEPLOYMENT",
             "temperature": 0.2,
+            "response_format": { "type": "json_object" },
             "messages": [
               {
                 "role": "system",
@@ -132,16 +115,21 @@ jobs:
               }
             ]
           }
-          JSON
+JSON
 
+          # Inject the live issue title/body into the prompt.
           python3 - "$PAYLOAD" <<'PY'
           import json, os, sys
           payload = sys.argv[1]
           with open(payload, "r", encoding="utf-8") as f:
               data = json.load(f)
-          title = os.environ.get("ISSUE_TITLE","")
-          body  = os.environ.get("ISSUE_BODY","")
-          data["messages"][1]["content"] = data["messages"][1]["content"].replace("__TITLE__", title).replace("__BODY__", body)
+          title = os.environ.get("ISSUE_TITLE", "")
+          body  = os.environ.get("ISSUE_BODY", "")
+          data["messages"][1]["content"] = (
+              data["messages"][1]["content"]
+              .replace("__TITLE__", title)
+              .replace("__BODY__", body)
+          )
           with open(payload, "w", encoding="utf-8") as f:
               json.dump(data, f, ensure_ascii=False)
           PY
@@ -204,106 +192,59 @@ jobs:
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import json, os, sys
+          import json, os, pathlib, sys
 
           result_path = os.environ["RESULT"]
           with open(result_path, "r", encoding="utf-8") as f:
-              result = json.load(f)
+            data = json.load(f)
 
-          blocked_exact = {
-              ".github/workflows/auto-code-generation.yml",
-              ".github/workflows/auto-code-generation.yaml"
-          }
-          blocked_prefixes = [".git/"]
+          files = data.get("files", [])
+          if not files:
+            print("No files to write. Exiting.")
+            sys.exit(1)
 
-          for item in result["files"]:
-              path = item.get("path","")
-              content = item.get("content","")
+          for item in files:
+            path = item.get("path")
+            content = item.get("content", "")
+            if not path or ".." in path or path.startswith("/") or path.startswith("\\"):
+              raise ValueError(f"Unsafe path: {path}")
 
-              if not isinstance(path, str) or not path.strip():
-                  print("❌ Invalid file path")
-                  sys.exit(1)
+            p = pathlib.Path(path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(content, encoding="utf-8")
 
-              if path.startswith(("/", "\\")):
-                  print(f"❌ Absolute path blocked: {path}")
-                  sys.exit(1)
-
-              if ".." in path.split("/"):
-                  print(f"❌ Path traversal blocked: {path}")
-                  sys.exit(1)
-
-              if path in blocked_exact:
-                  print(f"❌ Protected file blocked: {path}")
-                  sys.exit(1)
-
-              for bp in blocked_prefixes:
-                  if path.startswith(bp):
-                      print(f"❌ Protected path blocked: {path}")
-                      sys.exit(1)
-
-              # allow editing existing workflows but block creating new ones
-              if path.startswith(".github/workflows/") and not os.path.exists(path):
-                  print(f"❌ Creating new workflow files is blocked: {path}")
-                  sys.exit(1)
-
-              os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-              with open(path, "w", encoding="utf-8") as wf:
-                  wf.write(content)
-
-              print(f"Wrote: {path}")
+          print(f"✅ Wrote {len(files)} file(s).")
           PY
 
       # ------------------------------------------------------------
-      # 8) Create branch, commit, push
+      # 8) Create branch, commit, PR, close issue
       # ------------------------------------------------------------
-      - name: Create branch and commit changes
-        shell: bash
-        run: |
-          set -euo pipefail
-          BRANCH="auto-fix/issue-$ISSUE_NUMBER"
-
-          git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
-
-          git checkout -B "$BRANCH"
-          git add .
-
-          if git diff --cached --quiet; then
-            echo "❌ No changes produced by AI. Failing to avoid empty PR."
-            exit 1
-          fi
-
-          git commit -m "Auto-fix for issue #$ISSUE_NUMBER"
-          git push --force-with-lease origin "$BRANCH"
-
-      # ------------------------------------------------------------
-      # 9) Create PR + close issue
-      # ------------------------------------------------------------
-      - name: Create PR (or reuse existing) and close issue
+      - name: Create PR and close issue
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         shell: bash
         run: |
           set -euo pipefail
-          BRANCH="auto-fix/issue-$ISSUE_NUMBER"
 
-          if gh pr view --head "$BRANCH" >/dev/null 2>&1; then
-            echo "✅ PR already exists for $BRANCH. Skipping PR creation."
-          else
-            set +e
-            gh pr create \
-              --title "Auto fix: $ISSUE_TITLE" \
-              --body "Auto-generated by Azure OpenAI for issue #$ISSUE_NUMBER." \
-              --base main \
-              --head "$BRANCH"
-            rc=$?
-            set -e
+          ISSUE_NUMBER="${{ github.event.issue.number }}"
+          BRANCH="autofix-issue-${ISSUE_NUMBER}"
 
-            if [ "$rc" -ne 0 ]; then
-              echo "❌ PR creation failed."
-              echo "Fix: Repo Settings → Actions → General → enable 'Allow GitHub Actions to create and approve pull requests'."
-              exit 1
-            fi
-          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          gh issue close "$ISSUE_NUMBER" --comment "✅ Issue fixed and PR created/updated automatically."
+          git checkout -b "$BRANCH"
+          git add -A
+          git commit -m "Auto-fix: issue #${ISSUE_NUMBER}" || {
+            echo "No changes to commit."
+            exit 0
+          }
+          git push --set-upstream origin "$BRANCH"
+
+          PR_URL="$(gh pr create \
+            --title "Auto-fix: issue #${ISSUE_NUMBER}" \
+            --body "This PR was automatically generated for issue #${ISSUE_NUMBER}." \
+            --base main \
+            --head "$BRANCH")"
+
+          echo "✅ Created PR: $PR_URL"
+          gh issue close "$ISSUE_NUMBER" --comment "Created PR: $PR_URL"
