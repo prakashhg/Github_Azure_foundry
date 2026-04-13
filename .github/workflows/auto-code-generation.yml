@@ -1,11 +1,11 @@
-name: Auto Code Generation with Azure OpenAI (OIDC + API Key)
+name: Auto Code Generation with Azure AI Foundry (OIDC + API Key)
 
 on:
   issues:
-    types: [labeled]   # ✅ single run
+    types: [labeled]   # single run
 
 permissions:
-  id-token: write      # ✅ required for GitHub OIDC token minting [2](https://bing.com/search?q=GitHub+Actions+is+not+permitted+to+create+or+approve+pull+requests+createPullRequest+allow+GitHub+Actions+to+create+and+approve+pull+requests)
+  id-token: write
   contents: write
   pull-requests: write
   issues: write
@@ -16,10 +16,10 @@ concurrency:
 
 jobs:
   auto-fix:
-    name: Issue → Azure OpenAI → Branch/Commit → PR → Close Issue
+    name: Issue → Foundry → Branch/Commit → PR → Close Issue
     runs-on: ubuntu-latest
 
-    # ✅ Run only when the added label is autofix (or variants)
+    # Run only when the added label is autofix (or variants)
     if: >
       github.event.label.name == 'autofix' ||
       github.event.label.name == 'auto-fix' ||
@@ -46,7 +46,6 @@ jobs:
 
       # ------------------------------------------------------------
       # 3) Azure Login using OIDC (Workload Identity Federation)
-      #    Uses ARM_* secrets
       # ------------------------------------------------------------
       - name: Azure Login (OIDC)
         uses: azure/login@v2
@@ -54,7 +53,6 @@ jobs:
           client-id:       ${{ secrets.ARM_CLIENT_ID }}
           tenant-id:       ${{ secrets.ARM_TENANT_ID }}
           subscription-id: ${{ secrets.ARM_SUBSCRIPTION_ID }}
-        # azure/login + id-token:write is the standard GitHub→Azure OIDC pattern [1](https://journeyofthegeek.com/2023/04/06/authorization-in-azure-openai-service/)[2](https://bing.com/search?q=GitHub+Actions+is+not+permitted+to+create+or+approve+pull+requests+createPullRequest+allow+GitHub+Actions+to+create+and+approve+pull+requests)
 
       # ------------------------------------------------------------
       # 4) Extract issue details
@@ -74,7 +72,7 @@ jobs:
           echo "EOF" >> $GITHUB_ENV
 
       # ------------------------------------------------------------
-      # 5) Call Azure AI Foundry using API KEY
+      # 5) Call Azure AI Foundry using API KEY (NO HEREDOC)
       # ------------------------------------------------------------
       - name: Call Azure AI Foundry (API key)
         env:
@@ -89,7 +87,7 @@ jobs:
           ENDPOINT="${AZURE_OPENAI_ENDPOINT%/}"
           DEPLOYMENT="$AZURE_OPENAI_DEPLOYMENT"
 
-          # ✅ Azure AI Foundry model inference endpoint
+          # Foundry Model Inference endpoint:
           # POST https://{resource}.services.ai.azure.com/models/chat/completions?api-version=2024-05-01-preview
           URL="$ENDPOINT/models/chat/completions?api-version=2024-05-01-preview"
 
@@ -97,44 +95,62 @@ jobs:
           AI_RESP="$RUNNER_TEMP/ai-response.json"
           RESULT="$RUNNER_TEMP/result.json"
 
-          # Build the request payload.
-          # NOTE: 'model' should be your Foundry deployment name.
-          cat > "$PAYLOAD" <<JSON
-          {
-            "model": "$DEPLOYMENT",
-            "temperature": 0.2,
-            "response_format": { "type": "json_object" },
-            "messages": [
-              {
-                "role": "system",
-                "content": "You are a senior software engineer. Output ONLY valid JSON. No markdown. No explanations."
-              },
-              {
-                "role": "user",
-                "content": "Generate production-ready code for the GitHub issue below.\n\nReturn ONLY JSON with this schema:\n{\n  \"files\": [\n    {\"path\": \"relative/path/to/file.ext\", \"content\": \"file content\"}\n  ],\n  \"summary\": \"short summary\",\n  \"notes\": \"important notes\"\n}\n\nRules:\n- Output JSON only\n- files must be NON-EMPTY array\n- Paths must be relative and must not contain '..'\n- Do NOT modify .github/workflows/auto-code-generation.yml\n- Only update existing workflow files under .github/workflows/ if needed (do NOT create new ones)\n\nISSUE TITLE:\n__TITLE__\n\nISSUE BODY:\n__BODY__\n"
-              }
-            ]
-          }
+          # Export for Python usage
+          export PAYLOAD
+          export DEPLOYMENT
+          export ISSUE_TITLE="${ISSUE_TITLE:-}"
+          export ISSUE_BODY="${ISSUE_BODY:-}"
 
-          # Inject the live issue title/body into the prompt.
-          python3 - "$PAYLOAD" <<'PY'
-          import json, os, sys
-          payload = sys.argv[1]
-          with open(payload, "r", encoding="utf-8") as f:
-              data = json.load(f)
+          # Build payload via Python (prevents heredoc termination errors)
+          python3 - <<'PY'
+          import json, os, pathlib
+
+          payload_path = os.environ["PAYLOAD"]
+          deployment = os.environ["DEPLOYMENT"]
           title = os.environ.get("ISSUE_TITLE", "")
           body  = os.environ.get("ISSUE_BODY", "")
-          data["messages"][1]["content"] = (
-              data["messages"][1]["content"]
-              .replace("__TITLE__", title)
-              .replace("__BODY__", body)
+
+          user_prompt = (
+              "Generate production-ready code for the GitHub issue below.\n\n"
+              "Return ONLY JSON with this schema:\n"
+              "{\n"
+              '  "files": [\n'
+              '    {"path": "relative/path/to/file.ext", "content": "file content"}\n'
+              "  ],\n"
+              '  "summary": "short summary",\n'
+              '  "notes": "important notes"\n'
+              "}\n\n"
+              "Rules:\n"
+              "- Output JSON only\n"
+              "- files must be NON-EMPTY array\n"
+              "- Paths must be relative and must not contain '..'\n"
+              "- Do NOT modify .github/workflows/auto-code-generation.yml\n"
+              "- Only update existing workflow files under .github/workflows/ if needed (do NOT create new ones)\n\n"
+              f"ISSUE TITLE:\n{title}\n\n"
+              f"ISSUE BODY:\n{body}\n"
           )
-          with open(payload, "w", encoding="utf-8") as f:
-              json.dump(data, f, ensure_ascii=False)
+
+          payload = {
+              "model": deployment,
+              "temperature": 0.2,
+              "response_format": {"type": "json_object"},
+              "messages": [
+                  {
+                      "role": "system",
+                      "content": "You are a senior software engineer. Output ONLY valid JSON. No markdown. No explanations."
+                  },
+                  {"role": "user", "content": user_prompt}
+              ]
+          }
+
+          pathlib.Path(payload_path).write_text(
+              json.dumps(payload, ensure_ascii=False),
+              encoding="utf-8"
+          )
           PY
 
           HTTP_CODE="$(curl -sS -o "$AI_RESP" -w "%{http_code}" \
-            "$URL" \
+            -X POST "$URL" \
             -H "Content-Type: application/json" \
             -H "api-key: $AZURE_OPENAI_KEY" \
             --data-binary @"$PAYLOAD" || true)"
@@ -146,25 +162,41 @@ jobs:
       # ------------------------------------------------------------
       # 6) Validate Azure response (fail-fast)
       # ------------------------------------------------------------
-      - name: Validate Azure OpenAI response (fail fast)
+      - name: Validate Foundry response (fail fast)
         shell: bash
         run: |
           set -euo pipefail
+
+          # Guard against missing HTTP_CODE
+          if [ -z "${HTTP_CODE:-}" ]; then
+            echo "❌ HTTP_CODE is not set. Step 5 likely failed before calling the model."
+            exit 1
+          fi
+
           if [ "${HTTP_CODE}" -ne 200 ]; then
-            echo "❌ Azure OpenAI call failed with HTTP ${HTTP_CODE}"
-            head -c 2000 "$AI_RESP" || true
+            echo "❌ Foundry call failed with HTTP ${HTTP_CODE}"
+            head -c 4000 "$AI_RESP" || true
             exit 1
           fi
 
           python3 - <<'PY'
           import json, os, sys
+
           ai_resp = os.environ["AI_RESP"]
           result_path = os.environ["RESULT"]
 
           with open(ai_resp, "r", encoding="utf-8") as f:
               raw = json.load(f)
 
-          content = raw["choices"][0]["message"]["content"]
+          # OpenAI-style response shape includes choices[0].message.content
+          # (matches the documented sample response)
+          try:
+              content = raw["choices"][0]["message"]["content"]
+          except Exception:
+              print("❌ Unexpected response format. First 4000 chars:")
+              print(json.dumps(raw, indent=2)[:4000])
+              sys.exit(1)
+
           try:
               result = json.loads(content)
           except Exception as e:
@@ -180,7 +212,7 @@ jobs:
           with open(result_path, "w", encoding="utf-8") as f:
               json.dump(result, f, ensure_ascii=False, indent=2)
 
-          print("✅ Azure response valid JSON with non-empty files[]")
+          print("✅ Foundry response valid JSON with non-empty files[]")
           PY
 
       # ------------------------------------------------------------
@@ -195,22 +227,22 @@ jobs:
 
           result_path = os.environ["RESULT"]
           with open(result_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+              data = json.load(f)
 
           files = data.get("files", [])
           if not files:
-            print("No files to write. Exiting.")
-            sys.exit(1)
+              print("No files to write. Exiting.")
+              sys.exit(1)
 
           for item in files:
-            path = item.get("path")
-            content = item.get("content", "")
-            if not path or ".." in path or path.startswith("/") or path.startswith("\\"):
-              raise ValueError(f"Unsafe path: {path}")
+              path = item.get("path")
+              content = item.get("content", "")
+              if not path or ".." in path or path.startswith("/") or path.startswith("\\"):
+                  raise ValueError(f"Unsafe path: {path}")
 
-            p = pathlib.Path(path)
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(content, encoding="utf-8")
+              p = pathlib.Path(path)
+              p.parent.mkdir(parents=True, exist_ok=True)
+              p.write_text(content, encoding="utf-8")
 
           print(f"✅ Wrote {len(files)} file(s).")
           PY
@@ -233,10 +265,12 @@ jobs:
 
           git checkout -b "$BRANCH"
           git add -A
+
           git commit -m "Auto-fix: issue #${ISSUE_NUMBER}" || {
             echo "No changes to commit."
             exit 0
           }
+
           git push --set-upstream origin "$BRANCH"
 
           PR_URL="$(gh pr create \
