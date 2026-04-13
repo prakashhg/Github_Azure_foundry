@@ -115,7 +115,6 @@ jobs:
               }
             ]
           }
-JSON
 
           # Inject the live issue title/body into the prompt.
           python3 - "$PAYLOAD" <<'PY'
