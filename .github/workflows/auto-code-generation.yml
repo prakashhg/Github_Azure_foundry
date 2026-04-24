@@ -27,7 +27,7 @@ jobs:
 
     steps:
       # ----------------------------------------------------
-      # 1. Checkout main branch (IMPORTANT)
+      # 1. Checkout main branch
       # ----------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -35,14 +35,14 @@ jobs:
           ref: main
 
       # ----------------------------------------------------
-      # 2. Call Azure AI Foundry
+      # 2. Call Azure AI Foundry (CORRECT API VERSION)
       # ----------------------------------------------------
       - name: Call Azure AI Foundry
         run: |
           echo "Calling Azure AI Foundry..."
 
           curl -sS -X POST \
-            "$FOUNDRY_ENDPOINT/models/chat/completions?api-version=2024-02-15-preview" \
+            "$FOUNDRY_ENDPOINT/models/chat/completions?api-version=2024-05-01-preview" \
             -H "Authorization: Bearer $FOUNDRY_API_KEY" \
             -H "Content-Type: application/json" \
             -o foundry_response.json \
@@ -51,25 +51,27 @@ jobs:
               "messages": [
                 {
                   "role": "system",
-                  "content": "You are a senior DevOps engineer. Output only valid file content. No markdown."
+                  "content": "You are a senior DevOps engineer. Output ONLY valid Dockerfile content. No markdown. No explanation."
                 },
                 {
                   "role": "user",
-                  "content": "Create a production-grade Dockerfile for a Node.js 22 application."
+                  "content": "Create a production-ready Dockerfile for a Node.js 22 application. Use multistage build, non-root user, and best practices."
                 }
               ],
               "temperature": 0.2
             }'
 
       # ----------------------------------------------------
-      # 3. Write generated Dockerfile
+      # 3. Generate Dockerfile from Foundry response
       # ----------------------------------------------------
-      - name: Apply generated code
+      - name: Create Dockerfile
         run: |
           jq -r '.choices[0].message.content' foundry_response.json > Dockerfile
+          echo "Generated Dockerfile:"
+          cat Dockerfile
 
       # ----------------------------------------------------
-      # 4. Commit changes (ON MAIN)
+      # 4. Commit changes (stay on main)
       # ----------------------------------------------------
       - name: Commit changes
         run: |
@@ -79,7 +81,7 @@ jobs:
           git commit -m "Add Dockerfile for Node.js 22 (Issue #${ISSUE_NUMBER})"
 
       # ----------------------------------------------------
-      # 5. Create Pull Request (LET ACTION CREATE BRANCH)
+      # 5. Create Pull Request (action creates branch)
       # ----------------------------------------------------
       - name: Create Pull Request
         uses: peter-evans/create-pull-request@v6
@@ -98,7 +100,7 @@ jobs:
           delete-branch: false
 
       # ----------------------------------------------------
-      # 6. Close the issue
+      # 6. Close the GitHub issue
       # ----------------------------------------------------
       - name: Close issue
         uses: actions/github-script@v7
