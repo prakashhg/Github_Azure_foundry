@@ -1,11 +1,10 @@
-name: Auto Code Generation with Azure AI Foundry (OIDC + API Key)
+name: Auto Code Generation with Azure AI Foundry
 
 on:
   issues:
-    types: [labeled]   # single run
+    types: [labeled]
 
 permissions:
-  id-token: write
   contents: write
   pull-requests: write
   issues: write
@@ -16,268 +15,113 @@ concurrency:
 
 jobs:
   auto-fix:
-    name: Issue → Foundry → Branch/Commit → PR → Close Issue
+    name: Issue → Foundry → Branch → PR → Close Issue
     runs-on: ubuntu-latest
 
-    # Run only when the added label is autofix (or variants)
-    if: >
-      github.event.label.name == 'autofix' ||
-      github.event.label.name == 'auto-fix' ||
-      github.event.label.name == 'auto fix' ||
-      github.event.label.name == 'AutoFix' ||
-      github.event.label.name == 'Auto-Fix'
+    env:
+      FOUNDRY_ENDPOINT: ${{ secrets.AZURE_FOUNDRY_ENDPOINT }}
+      FOUNDRY_API_KEY: ${{ secrets.AZURE_FOUNDRY_API_KEY }}
+      FOUNDRY_MODEL: ${{ secrets.AZURE_FOUNDRY_MODEL }}
+      ISSUE_NUMBER: ${{ github.event.issue.number }}
+      ISSUE_TITLE: ${{ github.event.issue.title }}
 
     steps:
-      # ------------------------------------------------------------
-      # 1) Checkout
-      # ------------------------------------------------------------
+      # ----------------------------------------------------
+      # 1. Checkout repository
+      # ----------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      # ------------------------------------------------------------
-      # 2) Setup Python
-      # ------------------------------------------------------------
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      # ------------------------------------------------------------
-      # 3) Azure Login using OIDC (Workload Identity Federation)
-      # ------------------------------------------------------------
-      - name: Azure Login (OIDC)
-        uses: azure/login@v2
-        with:
-          client-id:       ${{ secrets.ARM_CLIENT_ID }}
-          tenant-id:       ${{ secrets.ARM_TENANT_ID }}
-          subscription-id: ${{ secrets.ARM_SUBSCRIPTION_ID }}
-
-      # ------------------------------------------------------------
-      # 4) Extract issue details
-      # ------------------------------------------------------------
-      - name: Extract issue details
-        shell: bash
+      # ----------------------------------------------------
+      # 2. Create working branch
+      # ----------------------------------------------------
+      - name: Create branch
         run: |
-          set -euo pipefail
-          echo "ISSUE_NUMBER=${{ github.event.issue.number }}" >> $GITHUB_ENV
-
-          echo "ISSUE_TITLE<<EOF" >> $GITHUB_ENV
-          echo "${{ github.event.issue.title }}" >> $GITHUB_ENV
-          echo "EOF" >> $GITHUB_ENV
-
-          echo "ISSUE_BODY<<EOF" >> $GITHUB_ENV
-          echo "${{ github.event.issue.body }}" >> $GITHUB_ENV
-          echo "EOF" >> $GITHUB_ENV
-
-      # ------------------------------------------------------------
-      # 5) Call Azure AI Foundry using API KEY (NO HEREDOC)
-      # ------------------------------------------------------------
-      - name: Call Azure AI Foundry (API key)
-        env:
-          AZURE_OPENAI_ENDPOINT:   ${{ secrets.AZURE_OPENAI_ENDPOINT }}
-          AZURE_OPENAI_DEPLOYMENT: ${{ secrets.AZURE_OPENAI_DEPLOYMENT }}
-          AZURE_OPENAI_KEY:        ${{ secrets.AZURE_OPENAI_KEY }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "::add-mask::$AZURE_OPENAI_KEY"
-
-          ENDPOINT="${AZURE_OPENAI_ENDPOINT%/}"
-          DEPLOYMENT="$AZURE_OPENAI_DEPLOYMENT"
-
-          # Foundry Model Inference endpoint:
-          # POST https://{resource}.services.ai.azure.com/models/chat/completions?api-version=2024-05-01-preview
-          URL="$ENDPOINT/models/chat/completions?api-version=2024-05-01-preview"
-
-          PAYLOAD="$RUNNER_TEMP/payload.json"
-          AI_RESP="$RUNNER_TEMP/ai-response.json"
-          RESULT="$RUNNER_TEMP/result.json"
-
-          # Export for Python usage
-          export PAYLOAD
-          export DEPLOYMENT
-          export ISSUE_TITLE="${ISSUE_TITLE:-}"
-          export ISSUE_BODY="${ISSUE_BODY:-}"
-
-          # Build payload via Python (prevents heredoc termination errors)
-          python3 - <<'PY'
-          import json, os, pathlib
-
-          payload_path = os.environ["PAYLOAD"]
-          deployment = os.environ["DEPLOYMENT"]
-          title = os.environ.get("ISSUE_TITLE", "")
-          body  = os.environ.get("ISSUE_BODY", "")
-
-          user_prompt = (
-              "Generate production-ready code for the GitHub issue below.\n\n"
-              "Return ONLY JSON with this schema:\n"
-              "{\n"
-              '  "files": [\n'
-              '    {"path": "relative/path/to/file.ext", "content": "file content"}\n'
-              "  ],\n"
-              '  "summary": "short summary",\n'
-              '  "notes": "important notes"\n'
-              "}\n\n"
-              "Rules:\n"
-              "- Output JSON only\n"
-              "- files must be NON-EMPTY array\n"
-              "- Paths must be relative and must not contain '..'\n"
-              "- Do NOT modify .github/workflows/auto-code-generation.yml\n"
-              "- Only update existing workflow files under .github/workflows/ if needed (do NOT create new ones)\n\n"
-              f"ISSUE TITLE:\n{title}\n\n"
-              f"ISSUE BODY:\n{body}\n"
-          )
-
-          payload = {
-              "model": deployment,
-              "temperature": 0.2,
-              "response_format": {"type": "json_object"},
-              "messages": [
-                  {
-                      "role": "system",
-                      "content": "You are a senior software engineer. Output ONLY valid JSON. No markdown. No explanations."
-                  },
-                  {"role": "user", "content": user_prompt}
-              ]
-          }
-
-          pathlib.Path(payload_path).write_text(
-              json.dumps(payload, ensure_ascii=False),
-              encoding="utf-8"
-          )
-          PY
-
-          HTTP_CODE="$(curl -sS -o "$AI_RESP" -w "%{http_code}" \
-            -X POST "$URL" \
-            -H "Content-Type: application/json" \
-            -H "api-key: $AZURE_OPENAI_KEY" \
-            --data-binary @"$PAYLOAD" || true)"
-
-          echo "HTTP_CODE=$HTTP_CODE" >> $GITHUB_ENV
-          echo "AI_RESP=$AI_RESP" >> $GITHUB_ENV
-          echo "RESULT=$RESULT" >> $GITHUB_ENV
-
-      # ------------------------------------------------------------
-      # 6) Validate Azure response (fail-fast)
-      # ------------------------------------------------------------
-      - name: Validate Foundry response (fail fast)
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          # Guard against missing HTTP_CODE
-          if [ -z "${HTTP_CODE:-}" ]; then
-            echo "❌ HTTP_CODE is not set. Step 5 likely failed before calling the model."
-            exit 1
-          fi
-
-          if [ "${HTTP_CODE}" -ne 200 ]; then
-            echo "❌ Foundry call failed with HTTP ${HTTP_CODE}"
-            head -c 4000 "$AI_RESP" || true
-            exit 1
-          fi
-
-          python3 - <<'PY'
-          import json, os, sys
-
-          ai_resp = os.environ["AI_RESP"]
-          result_path = os.environ["RESULT"]
-
-          with open(ai_resp, "r", encoding="utf-8") as f:
-              raw = json.load(f)
-
-          # OpenAI-style response shape includes choices[0].message.content
-          # (matches the documented sample response)
-          try:
-              content = raw["choices"][0]["message"]["content"]
-          except Exception:
-              print("❌ Unexpected response format. First 4000 chars:")
-              print(json.dumps(raw, indent=2)[:4000])
-              sys.exit(1)
-
-          try:
-              result = json.loads(content)
-          except Exception as e:
-              print("❌ Model did not return valid JSON:", e)
-              print(content[:2000])
-              sys.exit(1)
-
-          files = result.get("files")
-          if not isinstance(files, list) or len(files) == 0:
-              print("❌ JSON missing non-empty files[]")
-              sys.exit(1)
-
-          with open(result_path, "w", encoding="utf-8") as f:
-              json.dump(result, f, ensure_ascii=False, indent=2)
-
-          print("✅ Foundry response valid JSON with non-empty files[]")
-          PY
-
-      # ------------------------------------------------------------
-      # 7) Write generated files safely
-      # ------------------------------------------------------------
-      - name: Write generated files safely
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import json, os, pathlib, sys
-
-          result_path = os.environ["RESULT"]
-          with open(result_path, "r", encoding="utf-8") as f:
-              data = json.load(f)
-
-          files = data.get("files", [])
-          if not files:
-              print("No files to write. Exiting.")
-              sys.exit(1)
-
-          for item in files:
-              path = item.get("path")
-              content = item.get("content", "")
-              if not path or ".." in path or path.startswith("/") or path.startswith("\\"):
-                  raise ValueError(f"Unsafe path: {path}")
-
-              p = pathlib.Path(path)
-              p.parent.mkdir(parents=True, exist_ok=True)
-              p.write_text(content, encoding="utf-8")
-
-          print(f"✅ Wrote {len(files)} file(s).")
-          PY
-
-      # ------------------------------------------------------------
-      # 8) Create branch, commit, PR, close issue
-      # ------------------------------------------------------------
-      - name: Create PR and close issue
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          ISSUE_NUMBER="${{ github.event.issue.number }}"
-          BRANCH="autofix-issue-${ISSUE_NUMBER}"
-
-          git config user.name  "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
+          BRANCH="autofix/issue-${ISSUE_NUMBER}"
           git checkout -b "$BRANCH"
-          git add -A
+          echo "BRANCH=$BRANCH" >> $GITHUB_ENV
 
-          git commit -m "Auto-fix: issue #${ISSUE_NUMBER}" || {
-            echo "No changes to commit."
-            exit 0
-          }
+      # ----------------------------------------------------
+      # 3. Call Azure AI Foundry
+      # ----------------------------------------------------
+      - name: Call Azure AI Foundry
+        id: foundry
+        run: |
+          echo "Calling Azure AI Foundry..."
 
-          git push --set-upstream origin "$BRANCH"
+          RESPONSE=$(curl -sS -X POST \
+            "$FOUNDRY_ENDPOINT/models/chat/completions?api-version=2024-02-15-preview" \
+            -H "Authorization: Bearer $FOUNDRY_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "model": "'"$FOUNDRY_MODEL"'",
+              "messages": [
+                {
+                  "role": "system",
+                  "content": "You are a senior software engineer. Output only corrected code."
+                },
+                {
+                  "role": "user",
+                  "content": "Fix the GitHub issue titled: '"$ISSUE_TITLE"'. Apply minimal, correct code changes."
+                }
+              ],
+              "temperature": 0.2
+            }')
 
-          PR_URL="$(gh pr create \
-            --title "Auto-fix: issue #${ISSUE_NUMBER}" \
-            --body "This PR was automatically generated for issue #${ISSUE_NUMBER}." \
-            --base main \
-            --head "$BRANCH")"
+          echo "$RESPONSE" > foundry_response.json
 
-          echo "✅ Created PR: $PR_URL"
-          gh issue close "$ISSUE_NUMBER" --comment "Created PR: $PR_URL"
+      # ----------------------------------------------------
+      # 4. Apply generated code (example assumes README change)
+      # Adjust this logic for your real use case
+      # ----------------------------------------------------
+      - name: Apply code changes
+        run: |
+          jq -r '.choices[0].message.content' foundry_response.json > GENERATED_OUTPUT.txt
+          echo "## Auto-generated Fix" >> README.md
+          cat GENERATED_OUTPUT.txt >> README.md
+
+      # ----------------------------------------------------
+      # 5. Commit changes
+      # ----------------------------------------------------
+      - name: Commit changes
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add .
+          git commit -m "Auto fix for issue #${ISSUE_NUMBER}"
+
+      # ----------------------------------------------------
+      # 6. Push branch
+      # ----------------------------------------------------
+      - name: Push branch
+        run: |
+          git push origin "$BRANCH"
+
+      # ----------------------------------------------------
+      # 7. Create Pull Request
+      # ----------------------------------------------------
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: ${{ env.BRANCH }}
+          title: "Auto-fix: Issue #${{ env.ISSUE_NUMBER }}"
+          body: |
+            This PR was generated automatically using **Azure AI Foundry**.
+
+            - Issue: #${{ env.ISSUE_NUMBER }}
+            - Model: ${{ env.FOUNDRY_MODEL }}
+          labels: automated, ai-fix
+
+      # ----------------------------------------------------
+      # 8. Close issue after PR
+      # ----------------------------------------------------
+      - name: Close issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            github.rest.issues.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              state: "closed"
+            })
