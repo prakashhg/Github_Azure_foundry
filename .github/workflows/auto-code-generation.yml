@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   auto-fix:
-    name: Issue → Foundry → Branch → PR → Close Issue
+    name: Issue → Foundry → PR → Close Issue
     runs-on: ubuntu-latest
 
     env:
@@ -27,83 +27,67 @@ jobs:
 
     steps:
       # ----------------------------------------------------
-      # 1. Checkout repository
+      # 1. Checkout main branch (IMPORTANT)
       # ----------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: main
 
       # ----------------------------------------------------
-      # 2. Create working branch
-      # ----------------------------------------------------
-      - name: Create branch
-        run: |
-          BRANCH="autofix/issue-${ISSUE_NUMBER}"
-          git checkout -b "$BRANCH"
-          echo "BRANCH=$BRANCH" >> $GITHUB_ENV
-
-      # ----------------------------------------------------
-      # 3. Call Azure AI Foundry
+      # 2. Call Azure AI Foundry
       # ----------------------------------------------------
       - name: Call Azure AI Foundry
-        id: foundry
         run: |
           echo "Calling Azure AI Foundry..."
 
-          RESPONSE=$(curl -sS -X POST \
+          curl -sS -X POST \
             "$FOUNDRY_ENDPOINT/models/chat/completions?api-version=2024-02-15-preview" \
             -H "Authorization: Bearer $FOUNDRY_API_KEY" \
             -H "Content-Type: application/json" \
+            -o foundry_response.json \
             -d '{
               "model": "'"$FOUNDRY_MODEL"'",
               "messages": [
                 {
                   "role": "system",
-                  "content": "You are a senior software engineer. Output only corrected code."
+                  "content": "You are a senior DevOps engineer. Output only valid file content. No markdown."
                 },
                 {
                   "role": "user",
-                  "content": "Fix the GitHub issue titled: '"$ISSUE_TITLE"'. Apply minimal, correct code changes."
+                  "content": "Create a production-grade Dockerfile for a Node.js 22 application."
                 }
               ],
               "temperature": 0.2
-            }')
-
-          echo "$RESPONSE" > foundry_response.json
+            }'
 
       # ----------------------------------------------------
-      # 4. Apply generated code (example assumes README change)
-      # Adjust this logic for your real use case
+      # 3. Write generated Dockerfile
       # ----------------------------------------------------
-      - name: Apply code changes
+      - name: Apply generated code
         run: |
-          jq -r '.choices[0].message.content' foundry_response.json > GENERATED_OUTPUT.txt
-          echo "## Auto-generated Fix" >> README.md
-          cat GENERATED_OUTPUT.txt >> README.md
+          jq -r '.choices[0].message.content' foundry_response.json > Dockerfile
 
       # ----------------------------------------------------
-      # 5. Commit changes
+      # 4. Commit changes (ON MAIN)
       # ----------------------------------------------------
       - name: Commit changes
         run: |
-          git config user.name "github-actions"
-          git config user.email "github-actions@github.com"
-          git add .
-          git commit -m "Auto fix for issue #${ISSUE_NUMBER}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Dockerfile
+          git commit -m "Add Dockerfile for Node.js 22 (Issue #${ISSUE_NUMBER})"
 
       # ----------------------------------------------------
-      # 6. Push branch
-      # ----------------------------------------------------
-      - name: Push branch
-        run: |
-          git push origin "$BRANCH"
-
-      # ----------------------------------------------------
-      # 7. Create Pull Request
+      # 5. Create Pull Request (LET ACTION CREATE BRANCH)
       # ----------------------------------------------------
       - name: Create Pull Request
         uses: peter-evans/create-pull-request@v6
         with:
-          branch: ${{ env.BRANCH }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          base: main
+          branch: autofix/issue-${{ env.ISSUE_NUMBER }}
+          commit-message: "Auto-fix for issue #${{ env.ISSUE_NUMBER }}"
           title: "Auto-fix: Issue #${{ env.ISSUE_NUMBER }}"
           body: |
             This PR was generated automatically using **Azure AI Foundry**.
@@ -111,15 +95,16 @@ jobs:
             - Issue: #${{ env.ISSUE_NUMBER }}
             - Model: ${{ env.FOUNDRY_MODEL }}
           labels: automated, ai-fix
+          delete-branch: false
 
       # ----------------------------------------------------
-      # 8. Close issue after PR
+      # 6. Close the issue
       # ----------------------------------------------------
       - name: Close issue
         uses: actions/github-script@v7
         with:
           script: |
-            github.rest.issues.update({
+            await github.rest.issues.update({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
