@@ -1,0 +1,146 @@
+name: Azure Foundry – PR Review (Production)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: azure-foundry-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  pr-review:
+    runs-on: ubuntu-latest   # ✅ IMPORTANT: use GitHub-hosted Linux runner
+    name: Azure Foundry PR Review
+
+    steps:
+      # --------------------------------------------------
+      # ✅ FIXED CHECKOUT (no submodules)
+      # --------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: false   # ✅ CRITICAL FIX
+          clean: true
+
+      # --------------------------------------------------
+      # Detect changed files
+      # --------------------------------------------------
+      - name: Detect changed files
+        run: |
+          git fetch origin ${{ github.base_ref }}
+          git diff --name-only origin/${{ github.base_ref }} > changed_files.txt
+
+          if [ ! -s changed_files.txt ]; then
+            echo "No changes detected. Skipping review."
+            exit 0
+          fi
+
+      # --------------------------------------------------
+      # Build Azure Foundry payload
+      # --------------------------------------------------
+      - name: Prepare Azure Foundry payload
+        run: |
+          jq -Rs . < changed_files.txt > files.json
+
+          jq -n \
+            --arg agentId "${{ secrets.AZURE_FOUNDRY_AGENT_ID }}" \
+            --arg repo "${{ github.repository }}" \
+            --arg pr "${{ github.event.pull_request.number }}" \
+            --arg base "${{ github.base_ref }}" \
+            --arg head "${{ github.head_ref }}" \
+            --slurpfile files files.json \
+            '{
+              agent_id: $agentId,
+              repository: $repo,
+              pull_request_number: $pr,
+              base_branch: $base,
+              head_branch: $head,
+              changed_files: $files[0]
+            }' > payload.json
+
+      # --------------------------------------------------
+      # Call Azure Foundry managed agent
+      # --------------------------------------------------
+      - name: Invoke Azure Foundry Agent
+        env:
+          FOUNDRY_ENDPOINT: ${{ secrets.AZURE_FOUNDRY_ENDPOINT }}
+          FOUNDRY_API_KEY: ${{ secrets.AZURE_FOUNDRY_API_KEY }}
+        run: |
+          curl -s -X POST "$FOUNDRY_ENDPOINT" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $FOUNDRY_API_KEY" \
+            -d @payload.json \
+            > review.json
+
+      # --------------------------------------------------
+      # Post PR Review Comment
+      # --------------------------------------------------
+      - name: Post PR review comment
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if (-not (Test-Path "review.json")) {
+            Write-Error "review.json not found"
+            exit 1
+          }
+
+          $review = Get-Content review.json -Raw | ConvertFrom-Json
+          $agentText = ""
+
+          if ($review.output) {
+            foreach ($item in $review.output) {
+              if ($item.content) {
+                foreach ($c in $item.content) {
+                  if ($c.type -eq "output_text" -and $c.text) {
+                    $agentText += $c.text + "`n"
+                  }
+                }
+              }
+            }
+          }
+
+          if ([string]::IsNullOrWhiteSpace($agentText)) {
+            $agentText = "Azure Foundry agent completed but returned no readable output."
+          }
+
+          $codeFence = ('`' * 3)
+          $commentBody = @(
+            '## 🤖 Azure Foundry AI – Pull Request Review',
+            '',
+            'Automated analysis:',
+            '',
+            $codeFence,
+            $agentText.TrimEnd(),
+            $codeFence,
+            '',
+            '---',
+            'Generated automatically by Azure Foundry SDLC Agent'
+          ) -join "`n"
+
+          $repo     = $env:GITHUB_REPOSITORY
+          $prNumber = $env:GITHUB_REF -replace 'refs/pull/', '' -replace '/merge', ''
+          $apiUrl   = "https://api.github.com/repos/$repo/issues/$prNumber/comments"
+
+          $headers = @{
+            Authorization = "Bearer $env:GITHUB_TOKEN"
+            Accept        = "application/vnd.github+json"
+            "User-Agent"  = "azure-foundry-sdlc-agent"
+          }
+
+          $payload = @{ body = $commentBody } | ConvertTo-Json -Depth 10
+
+          Invoke-RestMethod `
+            -Uri $apiUrl `
+            -Method POST `
+            -Headers $headers `
+            -Body $payload `
+            -ContentType "application/json"
+
+          Write-Host "✅ PR review posted successfully"
