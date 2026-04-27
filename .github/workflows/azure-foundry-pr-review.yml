@@ -1,97 +1,182 @@
-name: Azure Foundry – PR Review (Production)
+name: AI Driven Full SDLC Automation
 
 on:
+  issues:
+    types: [opened, reopened]
+
   pull_request:
-    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, closed, reopened]
+    branches:
+        - Rahul_Poc
+
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
 
 permissions:
-  contents: read
+  contents: write
   pull-requests: write
+  issues: write
 
-concurrency:
-  group: azure-foundry-pr-${{ github.event.pull_request.number }}
-  cancel-in-progress: true
+env:
+  FOUNDRY_ENDPOINT: ${{ secrets.AZURE_FOUNDRY_ENDPOINT }}
+  FOUNDRY_AGENT_ID: ${{ secrets.AZURE_FOUNDRY_AGENT_ID }}
+  FOUNDRY_API_KEY: ${{ secrets.AZURE_FOUNDRY_API_KEY }}
 
 jobs:
-  pr-review:
-    runs-on: ubuntu-latest   # ✅ IMPORTANT: use GitHub-hosted Linux runner
-    name: Azure Foundry PR Review
+
+# ======================================
+# REVIEW STAGE – Azure Foundry AI Review
+# ======================================
+  review:
+    if: github.event_name == 'pull_request' && github.event.action != 'closed'
+    runs-on: self-hosted
 
     steps:
-      # --------------------------------------------------
-      # ✅ FIXED CHECKOUT (no submodules)
-      # --------------------------------------------------
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          submodules: false   # ✅ CRITICAL FIX
-          clean: true
-
-      # --------------------------------------------------
-      # Detect changed files
-      # --------------------------------------------------
-      - name: Detect changed files
-        run: |
-          git fetch origin ${{ github.base_ref }}
-          git diff --name-only origin/${{ github.base_ref }} > changed_files.txt
-
-          if [ ! -s changed_files.txt ]; then
-            echo "No changes detected. Skipping review."
-            exit 0
-          fi
-
-      # --------------------------------------------------
-      # Build Azure Foundry payload
-      # --------------------------------------------------
-      - name: Prepare Azure Foundry payload
-        run: |
-          jq -Rs . < changed_files.txt > files.json
-
-          jq -n \
-            --arg agentId "${{ secrets.AZURE_FOUNDRY_AGENT_ID }}" \
-            --arg repo "${{ github.repository }}" \
-            --arg pr "${{ github.event.pull_request.number }}" \
-            --arg base "${{ github.base_ref }}" \
-            --arg head "${{ github.head_ref }}" \
-            --slurpfile files files.json \
-            '{
-              agent_id: $agentId,
-              repository: $repo,
-              pull_request_number: $pr,
-              base_branch: $base,
-              head_branch: $head,
-              changed_files: $files[0]
-            }' > payload.json
-
-      # --------------------------------------------------
-      # Call Azure Foundry managed agent
-      # --------------------------------------------------
-      - name: Invoke Azure Foundry Agent
+      - name: Azure Foundry Agent Run Review (Responses API)
+        shell: powershell
         env:
-          FOUNDRY_ENDPOINT: ${{ secrets.AZURE_FOUNDRY_ENDPOINT }}
+          FOUNDRY_ENDPOINT: https://foundry-agent-automation.services.ai.azure.com
+          FOUNDRY_PROJECT: SDLC-Automation
+          FOUNDRY_APPLICATION: Agent910
           FOUNDRY_API_KEY: ${{ secrets.AZURE_FOUNDRY_API_KEY }}
         run: |
-          curl -s -X POST "$FOUNDRY_ENDPOINT" \
-            -H "Content-Type: application/json" \
-            -H "Authorization: Bearer $FOUNDRY_API_KEY" \
-            -d @payload.json \
-            > review.json
+          if (-not $env:FOUNDRY_API_KEY) {
+            Write-Error "FOUNDRY_API_KEY not set"
+            exit 1
+          }
 
-      # --------------------------------------------------
-      # Post PR Review Comment
-      # --------------------------------------------------
-      - name: Post PR review comment
-        shell: pwsh
+          Write-Host "Preparing Azure Foundry PR review request..."
+
+          # -----------------------------
+          # Build Foundry request object
+          # -----------------------------
+          $requestObject = @{
+            model = "sdlc-agent"
+            input = @(
+              # -------- SYSTEM MESSAGE --------
+              @{
+                type = "message"
+                role = "system"
+                content = @(
+                  @{
+                    type = "input_text"
+                    text = @"
+          You are a Senior Software Engineer and DevOps Review Agent supporting
+          an automated GitHub-based SDLC.
+
+          You operate strictly based on the 'stage' provided in the prompt.
+
+          Global rules:
+          - Act as a senior reviewer, not a passive assistant
+          - Be concise, structured, and risk-focused
+          - Review only the information explicitly provided
+          - Do NOT assume Java source code is present
+          - Adapt review criteria based on file types mentioned
+          - Do NOT request Java files unless Java files are explicitly included
+          "@
+                      }
+                    )
+                  },
+
+                  # -------- USER MESSAGE (AUTO-GENERATED FROM PR) --------
+          @{
+            type = "message"
+            role = "user"
+            content = @(
+              @{
+                type = "input_text"
+                text = @"
+          Stage: review.
+
+          Pull Request Title:
+          $env:PR_TITLE
+
+          Pull Request Description:
+          $env:PR_BODY
+
+          Files Changed:
+          $env:PR_FILES
+
+          Review the Pull Request based ONLY on the information above.
+
+          Provide:
+          - Summary of changes
+          - Identified risks (Low / Medium / High)
+          - Actionable recommendations
+          - Ready-to-merge decision with justification
+
+          Always respond with a textual Pull Request review.
+          "@
+              }
+            )
+          }
+
+
+          
+          "@
+                      }
+                    )
+                  }
+                )
+              }
+
+          # -----------------------------
+          # Convert request to JSON
+          # -----------------------------
+          $requestJson = $requestObject | ConvertTo-Json -Depth 20
+          Set-Content -Path request.json -Value $requestJson -Encoding UTF8
+
+          # -----------------------------
+          # Azure Foundry Responses API URL
+          # -----------------------------
+          $url = "$env:FOUNDRY_ENDPOINT/api/projects/$env:FOUNDRY_PROJECT/applications/$env:FOUNDRY_APPLICATION/protocols/openai/responses?api-version=2025-11-15-preview"
+
+          Write-Host "Calling Foundry Responses API:"
+          Write-Host $url
+
+          # -----------------------------
+          # Invoke Foundry
+          # -----------------------------
+          curl.exe -s -S -X POST `
+            "$url" `
+            -H "Content-Type: application/json" `
+            -H "api-key: $env:FOUNDRY_API_KEY" `
+            --data-binary "@request.json" `
+            -o review.json
+
+          Write-Host "Azure Foundry agent invoked successfully."
+          Write-Host "Response saved to review.json"
+      - name: Debug View review.json
+        shell: powershell
+        run: |
+          if (-not (Test-Path review.json)) {
+            Write-Error "review.json not found"
+            exit 1
+          }
+
+          Write-Host "========== review.json BEGIN =========="
+          Get-Content review.json -Raw
+          Write-Host "=========== review.json END ==========="
+
+      - name: Post Foundry Review as PR Comment
+        shell: powershell
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if (-not (Test-Path "review.json")) {
+          # -----------------------------
+          # Validate Foundry output
+          # -----------------------------
+          if (-not (Test-Path review.json)) {
             Write-Error "review.json not found"
             exit 1
           }
 
           $review = Get-Content review.json -Raw | ConvertFrom-Json
+
+          # -----------------------------
+          # Robust extraction of agent output
+          # -----------------------------
           $agentText = ""
 
           if ($review.output) {
@@ -107,14 +192,18 @@ jobs:
           }
 
           if ([string]::IsNullOrWhiteSpace($agentText)) {
-            $agentText = "Azure Foundry agent completed but returned no readable output."
+            $agentText = "The Foundry agent completed execution but did not return a readable textual review. Please verify the PR context provided to the agent."
           }
 
+          # -----------------------------
+          # Build PR comment
+          # -----------------------------
           $codeFence = ('`' * 3)
+
           $commentBody = @(
-            '## 🤖 Azure Foundry AI – Pull Request Review',
+            '### Azure Foundry AI - Pull Request Review',
             '',
-            'Automated analysis:',
+            'Automated Analysis:',
             '',
             $codeFence,
             $agentText.TrimEnd(),
@@ -123,11 +212,25 @@ jobs:
             '---',
             'Generated automatically by Azure Foundry SDLC Agent'
           ) -join "`n"
+          
+
+          # -----------------------------
+          # Resolve PR number
+          # -----------------------------
+          if (-not $env:GITHUB_REF.StartsWith("refs/pull/")) {
+            Write-Error "This workflow is not running in a pull_request context"
+            exit 1
+          }
 
           $repo     = $env:GITHUB_REPOSITORY
           $prNumber = $env:GITHUB_REF -replace 'refs/pull/', '' -replace '/merge', ''
           $apiUrl   = "https://api.github.com/repos/$repo/issues/$prNumber/comments"
 
+          Write-Host "Posting review comment to PR #$prNumber"
+
+          # -----------------------------
+          # GitHub API call
+          # -----------------------------
           $headers = @{
             Authorization = "Bearer $env:GITHUB_TOKEN"
             Accept        = "application/vnd.github+json"
@@ -136,11 +239,19 @@ jobs:
 
           $payload = @{ body = $commentBody } | ConvertTo-Json -Depth 10
 
-          Invoke-RestMethod `
-            -Uri $apiUrl `
-            -Method POST `
-            -Headers $headers `
-            -Body $payload `
-            -ContentType "application/json"
+          try {
+            Invoke-RestMethod `
+              -Uri $apiUrl `
+              -Method POST `
+              -Headers $headers `
+              -Body $payload
+          }
+          catch {
+            Write-Error "Failed to post PR comment: $_"
+            exit 1
+          }
 
-          Write-Host "✅ PR review posted successfully"
+          Write-Host "PR review comment posted successfully."
+
+
+    
